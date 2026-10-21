@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><style>
+*{box-sizing:border-box}html,body{margin:0;padding:0;width:760px;background:transparent}
+body{font-family:"Segoe UI","Microsoft YaHei","Noto Sans CJK SC",sans-serif;color:{{ '#111' if light else '#f5f5f5' }}}
+.panel{width:760px;border-radius:28px;overflow:hidden;background:{{ '#fff' if light else '#000' }}}
+.header{height:240px;position:relative;overflow:hidden}
+.background{width:100%;height:100%;object-fit:cover;object-position:center 38%}
+.shade{position:absolute;inset:0;background:linear-gradient(180deg,transparent 35%,{{ 'rgba(255,255,255,.85)' if light else 'rgba(0,0,0,.8)' }} 78%,{{ '#fff' if light else '#000' }} 100%)}
+.heading{position:absolute;bottom:22px;left:64px;right:64px;display:flex;align-items:baseline;justify-content:space-between;gap:16px}
+.content{padding:0 64px 28px}
+.brand{font-size:100px;font-style:italic;font-weight:1000;letter-spacing:-5px;line-height:1}
+h1{font-size:26px;margin:0;font-weight:650;white-space:nowrap}
+.row{padding:11px 0;border-top:1px solid {{ '#0002' if light else '#fff3' }}}
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px}
+code{font-family:Consolas,"Microsoft YaHei",monospace;font-size:17px;font-weight:650;overflow-wrap:anywhere}
+.role{font-size:12px;white-space:nowrap;border:1px solid {{ '#0002' if light else '#fff3' }};border-radius:7px;padding:3px 7px}
+.description{font-size:14px;line-height:1.5;opacity:.7;margin-top:5px}
+.time{font-size:11px;opacity:.5;margin-top:18px;text-align:right;font-variant-numeric:tabular-nums}
+</style></head><body><article class="panel">
+<header class="header"><img class="background" src="{{ background|e }}"><div class="shade"></div><div class="heading"><div class="brand">MONITOR</div><h1>指令清单</h1></div></header>
+<div class="content">
+{% for command,role,description in commands %}<section class="row"><div class="top"><code>{{ command|e }}</code><span class="role">{{ role|e }}</span></div><div class="description">{{ description|e }}</div></section>{% endfor %}
+<div class="time">{{ time|e }}</div>
+</div></article></body></html>

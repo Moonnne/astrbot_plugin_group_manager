@@ -1,14 +1,96 @@
-# astrbot-plugin-helloworld
+# Monitor · QQ 群管理
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+版本 `v0.1.0`，作者 Moonne。适用于 AstrBot `>=4.29.1,<5` 的 `aiocqhttp` / OneBot v11 接入，面向 SnowLuma 和 NapCat。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+提供入群申请卡片、人工/自动审批、个人消歧编号、入群算术验证、群成员历史、群内黑白名单及跨群公共黑名单。
 
-# Supports
+## 开始使用
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+1. 安装插件并重载，确认机器人通过 AstrBot 的 OneBot v11 适配器连接。机器人需要 QQ 群管理员权限才能审批和移除成员。
+2. 在 AstrBot 配置中确保目标群允许插件运行，配置可用的模板文转图端点。
+3. 群主、群管理员或 AstrBot 管理员在目标群发送 `/g on`。初始总开关、自动批准和黑名单自动拒绝均关闭。
+4. 如需自动批准普通申请，发送 `/g auto`；再次发送关闭。群主可用 `/g auto skip_ban` 单独切换黑名单自动拒绝。
+
+所有显示时间固定使用北京时间，统一为 `YYYY-MM-DD HH:mm:ss UTC+8`。卡片在 06:00–18:00 使用白色主题，其余时间使用黑色主题。验证题始终白底黑字，不随卡片主题变化。
+用户卡片和帮助面板的生成时间均以 `Create Time:` 为前缀并靠右对齐；帮助顶部背景来自 `resource/background/default.png`，标题覆盖其上。
+
+## 命令
+
+方括号表示需要替换的参数，不要输入方括号。AstrBot 管理员拥有全部命令权限。
+命令仅在群中执行；无效参数、权限不足、没有目标请求/验证以及过期编号均静默。
+
+| 命令 | 权限 | 作用 |
+| --- | --- | --- |
+| `/g` / `/g help` | 所有群成员 | 用 AstrBot Jinja2 文转图显示指令清单；总开关关闭时也可查看 |
+| `/g on` / `/g off` | 群管理员及以上 | 开关审批和验证；关闭后继续记录成员进退 |
+| `/g y` / `/g n` | 群管理员及以上 | 同意/拒绝单个请求；多个请求则展示编号卡片 |
+| `/g y [编号/all]` / `/g n [编号/all]` | 群管理员及以上 | 处理本人最新消歧页中的请求 |
+| `/g auto` | 群管理员及以上 | 切换普通申请自动批准 |
+| `/g auto skip_ban` | 群主 | 切换黑名单自动拒绝，与 auto 独立 |
+| `/g ban [QQ号] [理由]` | 群主 | 加入本群黑名单，不立即踢人 |
+| `/g rmb [QQ号]` | 群主 | 撤销本群黑名单 |
+| `/g wl [QQ号] [备注]` | 群主 | 加入本群白名单，自动批准、免验证 |
+| `/g rmwl [QQ号]` | 群主 | 撤销本群白名单 |
+| `/g pb [QQ号] [理由]` | 群主 | 添加本人负责的公共黑名单记录 |
+| `/g rmpb [QQ号]` | 原添加人 | 撤销本人记录；AstrBot 管理员可撤销全部有效记录 |
+| `/g info [QQ号]` | 群管理员及以上 | 查询本群记录；公共黑名单对象附带跨群历史 |
+| `/ans [整数答案]` | 对应待验证成员 | 回答本人当前入群题目 |
+
+例如：`/g ban 123456789 多次广告`、`/g y 1`、`/ans 21`。理由和备注最多 1000 个字符。
+
+## 审批规则
+
+总开关开启后，按以下顺序处理新申请：
+
+1. 本群白名单始终优先，自动批准并免验证，包括同时在黑名单中的用户。
+2. 命中本群或公共黑名单时，skip_ban 开启则拒绝，否则转人工；auto 不会批准这类申请。
+3. 其他申请由 auto 决定自动批准或进入人工队列。
+
+请求由插件接管 30 分钟，超时后不再同意或拒绝，QQ 端原申请仍由 QQ 自身管理。重复事件不延长期限。
+消歧编号按群和操作人独立保存；无参数 y/n 每次重新编号，旧页失效。页内已处理项目不导致其他序号移动；新申请不会进入旧页的 all。
+消歧页自身有效 30 分钟，但不延长每条申请的截止时间。
+
+设置变更只影响新申请；`/g off` 会取消旧申请接管和待验证任务，重开不复活旧任务。名单和配置可在 off 状态下管理。
+卡片与回执发在当前群，对全群可见，操作权限独立校验。
+
+## 验证与记录
+
+普通成员实际入群后生成加、减、乘题。图片成功发送后有 10 分钟答题；答错可重试，不延长时间。白名单、群主、群管理员、AstrBot 管理员及机器人自身免验证。
+题目渲染/发送失败不启动踢人计时，最多尝试投递 3 次。到期前添加白名单会立即豁免。
+踢人前重新检查群开关、角色、成员身份和入群批次；不附带 QQ 端“禁止再次申请”。
+
+重启保留未过期验证的原截止时间；停机期间已过期的验证重新投递并给予完整 10 分钟。审批/踢人调用中断或超时会记录为结果未知，不盲目重试；必要时管理员在 QQ 原生界面核实。
+
+名单、审批、成员记录按平台实例、机器人账号和群号隔离。公共黑名单只在同一插件数据库内共享，不跨不同服务器同步。多个添加人可以分别标记同一 QQ，全部有效记录撤销后才解除公共标记。
+用户当前处于公共黑名单时，管理人员才可查询跨群历史；撤销后恢复仅本群可见。
+
+“最早入群”是插件或接口已知的最早时间；“退群次数”只统计插件观察到的事件，不能补造安装前或停机期间的数据。初始化成员快照不会对存量成员发验证。
+
+## 卡片和配置
+
+卡片使用 WinUI 3 风格的黑白圆角表面、亚克力覆盖层及 `MONITOR` 字样。资料卡图片可用时展示；缺失时使用主题底色。地区缺失显示“未公开”，账号等级缺失显示“未知”。
+头像旁集中展示昵称、等级与 QQ 标签、地区、性别、年龄和个性签名。卡片添加细点纹理、装饰线和半透明表面。申请方式、理由、审批状态与已知进退群数据放在独立记录卡片中；缺失记录不展示。
+“操作时间”仅展示已确认审批操作完成的时间，待审批或结果未知时不显示；查询成员时附带该群最近一次申请。黑白名单以底部小卡片展示操作人、操作时间及理由/备注；公共黑名单采用红色提醒。消歧编号显示在随图消息中。
+已核对 SnowLuma v2.0.3 与官方最新源码：现有接口未提供群号搜索、扫码分享者细分信息，按用户确认跳过该项，仅展示已知的申请方式或邀请人。
+QQ群成员等级不会作为 QQ 账号等级。具体扩展字段支持情况见 [SNOWLUMA.md](docs/SNOWLUMA.md)。
+
+卡片、帮助面板和公式均通过 AstrBot `Star.html_render` 的 Jinja2 模板服务，使用当前会话配置的渲染端点，资料会提交至该端点。卡片和帮助渲染失败降级文字。公式通过受限 LaTeX 表达式转换为 MathML，在独立白底模板中渲染，无需外部公式脚本或大模型。
+
+插件配置页提供 OneBot 超时（默认 15 秒）和渲染超时（默认 25 秒），修改后重载生效。
+SQLite 数据存于 `data/plugin_data/astrbot_plugin_group_manager/group_manager.sqlite3`。数据独立于插件源码；备份时停止插件并保留 SQLite 的一致性，不手动删除 WAL/SHM。
+
+黑白卡片和公式的合成数据预览：
+
+| 白色卡片 | 黑色卡片 |
+| --- | --- |
+| ![白色卡片](docs/previews/card-light.png) | ![黑色卡片](docs/previews/card-dark.png) |
+
+![白底公式](docs/previews/formula.png)
+
+帮助面板预览：[白色主题](docs/previews/help-light.png) · [黑色主题](docs/previews/help-dark.png)。
+名单小卡片预览：[白色主题](docs/previews/card-lists-light.png) · [黑色主题](docs/previews/card-lists-dark.png)，均为合成数据。
+
+## 开发
+
+实现、测试和限制见 [DEV.md](docs/DEV.md)；框架接入见 [ASTRBOT.md](docs/ASTRBOT.md)；需求和规则见 [DESIGN.md](docs/DESIGN.md)。
+运行依赖使用宿主已声明的包，不额外安装渲染服务。可选测试工具列在 `test/requirements.txt`。

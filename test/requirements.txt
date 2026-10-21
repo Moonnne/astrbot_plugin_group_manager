@@ -1,0 +1,5 @@
+pytest>=8
+pytest-asyncio>=0.23
+ruff>=0.9
+# Optional: local visual previews with an installed Chromium browser.
+playwright>=1.50
