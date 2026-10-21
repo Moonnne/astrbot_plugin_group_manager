@@ -17,6 +17,7 @@ from .core.repository import Repository
 from .core.rules import COMMAND, GROUP_ID
 from .core.settings import Settings
 from .models.scope import Scope
+from .utils.plugin_log import PluginLog, error_detail, event_summary
 from .utils.scope import group_umo, scope_key
 
 
@@ -25,13 +26,27 @@ class ScopeFilter(filter.CustomFilter):
 
     def filter(self, event, cfg):
         controller = self.runtime() if self.runtime else None
-        return bool(
+        allowed = bool(
             controller
             and not controller.stopping
             and event.get_platform_name() == "aiocqhttp"
             and controller.allows_group(event.get_group_id())
             and event.message_obj.raw_message.get("post_type") == "message"
         )
+        if (
+            controller
+            and COMMAND.match(event.message_str.strip())
+            and not event.get_extra("monitor_filter_logged")
+        ):
+            event.set_extra("monitor_filter_logged", True)
+            controller.log.debug(
+                "command.filter group=%s platform=%s allowed=%s wake=%s",
+                event.get_group_id(),
+                event.get_platform_name(),
+                allowed,
+                event.is_at_or_wake_command,
+            )
+        return allowed
 
 
 class GroupCommandFilter(ScopeFilter):
@@ -83,6 +98,7 @@ class GroupManager(Star):
         super().__init__(context, config)
         self.config = config if config is not None else {}
         self.controller = self.repository = self.events = None
+        self.file_log = None
         self.group_selector = GroupSelector(context, self.config, self.logger)
 
     async def initialize(self):
@@ -105,14 +121,34 @@ class GroupManager(Star):
         if not 3 <= api_timeout <= 60 or not 5 <= render_timeout <= 120:
             raise ValueError("Invalid timeout configuration")
         data = StarTools.get_data_dir("astrbot_plugin_group_manager")
-        self.repository = Repository(
-            data / "db/group_manager.sqlite3", root / "resource/sql"
+        log_task = asyncio.create_task(
+            asyncio.to_thread(PluginLog, self.logger, data / "log/monitor.log")
         )
-        await self.repository.open()
         try:
+            self.file_log = await asyncio.shield(log_task)
+        except asyncio.CancelledError:
+            created_log = await log_task
+            await asyncio.to_thread(created_log.close)
+            raise
+        self.logger = self.file_log
+        self.group_selector.log = self.logger
+        self.logger.info(
+            "lifecycle.initialize enabled_groups=%s api_timeout=%s render_timeout=%s data=%s",
+            sorted(enabled_groups),
+            api_timeout,
+            render_timeout,
+            data,
+        )
+        try:
+            self.repository = Repository(
+                data / "db/group_manager.sqlite3",
+                root / "resource/sql",
+                logger=self.logger,
+            )
+            await self.repository.open()
             self.controller = Controller(
                 self.repository,
-                OneBot(self.context, api_timeout),
+                OneBot(self.context, api_timeout, logger=self.logger),
                 Renderer(
                     self.html_render,
                     root / "resource/templates",
@@ -120,7 +156,7 @@ class GroupManager(Star):
                     background_url=self.config.get("help_background_url", ""),
                     logger=self.logger,
                 ),
-                Settings(data / "settings"),
+                Settings(data / "settings", logger=self.logger),
                 self.is_host_admin,
                 self.logger,
                 enabled_groups=enabled_groups,
@@ -131,7 +167,9 @@ class GroupManager(Star):
             self.events = GroupEvents(self.context, self.controller, self.logger)
             self.events.bind_all()
             await self.group_selector.refresh()
-        except BaseException:
+            self.logger.info("lifecycle.ready bindings=%s", len(self.events.bindings))
+        except BaseException as exc:
+            self.logger.error("lifecycle.initialize_failed error=%s", error_detail(exc))
             await self.terminate()
             raise
 
@@ -143,6 +181,11 @@ class GroupManager(Star):
         cfg = self.context.get_config(umo)
         plugins = cfg.get("plugin_set", ["*"])
         if plugins != ["*"] and "astrbot_plugin_group_manager" not in plugins:
+            self.logger.debug(
+                "scope.guard denied=plugin_set scope=%s selection=%s",
+                scope_key(scope),
+                plugins,
+            )
             return False
         settings = cfg.get("platform_settings", {})
         whitelist = {
@@ -153,10 +196,17 @@ class GroupManager(Star):
             and whitelist
             and not ({scope.group, umo} & whitelist)
         ):
+            self.logger.debug(
+                "scope.guard denied=host_whitelist scope=%s", scope_key(scope)
+            )
             return False
-        return await SessionPluginManager.is_plugin_enabled_for_session(
+        allowed = await SessionPluginManager.is_plugin_enabled_for_session(
             umo, "astrbot_plugin_group_manager"
         )
+        self.logger.debug(
+            "scope.guard session_enabled=%s scope=%s", allowed, scope_key(scope)
+        )
+        return allowed
 
     @filter.custom_filter(GroupCommandFilter, False)
     @filter.command_group("g", desc="Monitor 群管理")
@@ -240,6 +290,9 @@ class GroupManager(Star):
         await self.dispatch(event)
 
     async def dispatch(self, event):
+        self.logger.debug(
+            "command.dispatch event=%s", event_summary(event.message_obj.raw_message)
+        )
         if not self.controller or not self.controller.allows_group(
             event.get_group_id()
         ):
@@ -267,28 +320,40 @@ class GroupManager(Star):
             )
             if task:
                 await task
+            self.logger.debug(
+                "command.dispatch_complete scope=%s scheduled=%s",
+                scope_key(scope),
+                task is not None,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self.logger.error(
                 "Group command failed: scope=%s error=%s",
                 scope_key(scope),
-                type(exc).__name__,
+                error_detail(exc),
             )
 
     @filter.on_platform_loaded()
     async def platform_loaded(self):
+        self.logger.info(
+            "lifecycle.platform_loaded observer_ready=%s", bool(self.events)
+        )
         if self.events:
             self.events.bind_all()
             await self.group_selector.refresh()
 
     @filter.on_astrbot_loaded()
     async def loaded(self):
+        self.logger.info(
+            "lifecycle.astrbot_loaded observer_ready=%s", bool(self.events)
+        )
         if self.events:
             self.events.bind_all()
             await self.group_selector.refresh()
 
     async def terminate(self):
+        self.logger.info("lifecycle.terminate_begin")
         if self.events:
             self.events.stop()
         try:
@@ -297,5 +362,11 @@ class GroupManager(Star):
         finally:
             if ScopeFilter.runtime and ScopeFilter.runtime() is self.controller:
                 ScopeFilter.runtime = None
-            if self.repository:
-                await self.repository.close()
+            try:
+                if self.repository:
+                    await self.repository.close()
+            finally:
+                if self.file_log:
+                    self.logger.info("lifecycle.terminate_complete")
+                    await asyncio.to_thread(self.file_log.close)
+                    self.file_log = None

@@ -1,6 +1,6 @@
 # Monitor · QQ 群管理
 
-版本 `v0.2.0`，作者 Moonne。支持 AstrBot `>=4.29.1,<5` 的 OneBot v11（aiocqhttp），面向 SnowLuma 和 NapCat。
+版本 `0.1.1`，作者 Moonne。支持 AstrBot `>=4.29.1,<5` 的 OneBot v11（aiocqhttp），面向 SnowLuma 和 NapCat。
 
 提供申请卡片、人工／自动审批、全群共用消歧编号、入群算术验证、成员记录、本群黑白名单和公共黑名单。
 
@@ -62,8 +62,10 @@ AstrBot 管理员拥有最高命令权限；其余按群主、群管理员、成
 data/plugin_data/astrbot_plugin_group_manager/
 ├── db/
 │   └── group_manager.sqlite3
-└── settings/
-    └── onebot%3AGroupMessage%3A12345.json
+├── settings/
+│   └── onebot%3AGroupMessage%3A12345.json
+└── log/
+    └── monitor.log
 ```
 
 JSON 文件名是完整群 UMO 的百分号编码，避免 Windows 不支持冒号。同一 UMO 文件按机器人账号分别保存开关，数据库按平台实例、机器人和群隔离。
@@ -72,6 +74,16 @@ SQLite 只有三张表：`group_members`、`group_list_entries`、`public_blackl
 仅当前命中公共黑名单的对象允许查询其他群的成员汇总记录，不保存独立进退群事件表、历史批次表或审计表。
 
 本版本不包含旧数据库迁移、数据导入或自动删除旧库。备份时停止插件取得一致副本，不手动删除 WAL/SHM。
+
+## 诊断日志
+
+插件数据目录的 `log/monitor.log` 保留最近 1000 行日志，重载时接续保留。时间为北京时间，UTF-8／CRLF。
+记录生命周期、平台与回调绑定、原生事件接收、群范围和宿主准入、命令解析与权限、队列／后台任务、设置读取与保存、数据库事务、审批状态、验证、渲染和 OneBot 调用结果。
+文件保留 DEBUG 详情，不依赖控制台日志级别；不改变宿主或其他插件的日志设置。每行最多 2000 字符，异步合并写入，卸载时等待刷新并结束写入线程。
+申请 flag 只记摘要，用于串联数据流；不记录完整申请理由、命令备注、图片数据或 token。错误详情做敏感字段脱敏。
+
+若申请无反应，重载后在目标群执行 `/g on`，再发起一条新的加群申请，随后执行 `/g y` 或 `/g n`，提供该日志用于定位。
+0.1.1 仅补充诊断记录；申请漏收的实际原因仍待现场日志确认，没有加入收件箱补收、监听重绑或新的审批重试策略。
 
 ## 图片和性能
 

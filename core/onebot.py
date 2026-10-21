@@ -4,12 +4,16 @@ import asyncio
 import time
 from collections import OrderedDict
 
+from ..utils.plugin_log import error_detail, flag_ref
+from ..utils.scope import scope_key
+
 
 class OneBot:
-    def __init__(self, context, timeout=15):
+    def __init__(self, context, timeout=15, *, logger=None):
         self.context = context
         self.timeout = timeout
         self.profiles = OrderedDict()
+        self.log = logger
 
     def clear(self):
         self.profiles.clear()
@@ -34,12 +38,76 @@ class OneBot:
         Raises:
             RuntimeError: The requested OneBot platform is unavailable.
         """
+        started = time.monotonic()
+        if self.log:
+            summary = {
+                key: params[key]
+                for key in (
+                    "group_id",
+                    "user_id",
+                    "sub_type",
+                    "approve",
+                    "reject_add_request",
+                )
+                if key in params
+            }
+            if "flag" in params:
+                summary["flag_ref"] = flag_ref(params["flag"])
+            if isinstance(params.get("message"), list):
+                summary["segments"] = [part.get("type") for part in params["message"]]
+            self.log.debug(
+                "api.begin scope=%s action=%s params=%s",
+                scope_key(scope),
+                action,
+                summary,
+            )
         platform = self.context.get_platform_inst(scope.platform)
         if platform is None or platform.meta().name != "aiocqhttp":
+            if self.log:
+                self.log.error(
+                    "api.route_failed scope=%s action=%s reason=platform_unavailable",
+                    scope_key(scope),
+                    action,
+                )
             raise RuntimeError("OneBot platform is unavailable")
         client = platform.get_client()
-        async with asyncio.timeout(self.timeout):
-            return await client.call_action(action, self_id=int(scope.bot), **params)
+        try:
+            async with asyncio.timeout(self.timeout):
+                result = await client.call_action(
+                    action, self_id=int(scope.bot), **params
+                )
+            if self.log:
+                shape = (
+                    list(result)[:20]
+                    if isinstance(result, dict)
+                    else len(result)
+                    if isinstance(result, list)
+                    else type(result).__name__
+                )
+                self.log.debug(
+                    "api.complete action=%s scope=%s result_shape=%s duration_ms=%.0f",
+                    action,
+                    scope_key(scope),
+                    shape,
+                    (time.monotonic() - started) * 1000,
+                )
+            return result
+        except asyncio.CancelledError:
+            if self.log:
+                self.log.warning(
+                    "api.cancelled action=%s scope=%s", action, scope_key(scope)
+                )
+            raise
+        except Exception as exc:
+            if self.log:
+                self.log.error(
+                    "api.failed action=%s scope=%s duration_ms=%.0f error=%s",
+                    action,
+                    scope_key(scope),
+                    (time.monotonic() - started) * 1000,
+                    error_detail(exc),
+                )
+            raise
 
     async def member(self, scope, qq):
         result = await self.call(
@@ -92,6 +160,8 @@ class OneBot:
         self.prune()
         key = (scope.platform, scope.bot, qq)
         if key in self.profiles:
+            if self.log:
+                self.log.debug("profile.cache_hit scope=%s qq=%s", scope_key(scope), qq)
             return dict(self.profiles[key][1])
         profile = {
             "nickname": qq,
@@ -133,11 +203,27 @@ class OneBot:
             age = info.get("age")
             if isinstance(age, int) and 0 < age < 130:
                 profile["age"] = str(age)
-        except Exception:
-            pass
+        except Exception as exc:
+            if self.log:
+                self.log.warning(
+                    "profile.lookup_failed scope=%s qq=%s error=%s",
+                    scope_key(scope),
+                    qq,
+                    error_detail(exc),
+                )
         # Dress preview_url can contain an entire card. It is not a profile cover.
         # Verified SnowLuma 2.0.3 exposes no dedicated cover image; use the theme fallback.
         self.profiles[key] = (now + 120, dict(profile))
         while len(self.profiles) > 256:
             self.profiles.popitem(last=False)
+        if self.log:
+            self.log.debug(
+                "profile.complete scope=%s qq=%s nickname_available=%s level_available=%s cover_available=%s cache_size=%s",
+                scope_key(scope),
+                qq,
+                profile["nickname"] != qq,
+                profile["level"] != "未知",
+                bool(profile["cover"]),
+                len(self.profiles),
+            )
         return profile

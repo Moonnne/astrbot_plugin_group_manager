@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+from ..utils.plugin_log import error_detail
 from ..utils.scope import parse_scope
 from .rules import display_time, light_theme
 
@@ -94,7 +95,9 @@ class Renderer:
         )
         try:
             image = await self._render(self.help_template, data, umo, 760, True)
-        except Exception:
+        except Exception as exc:
+            if self.log:
+                self.log.warning("render.help_fallback error=%s", error_detail(exc))
             image = None
         return image, plain
 
@@ -248,7 +251,11 @@ class Renderer:
         }
         try:
             image = await self._render(self.card_template, data, umo, 640, True)
-        except Exception:
+        except Exception as exc:
+            if self.log:
+                self.log.warning(
+                    "render.card_fallback qq=%s error=%s", qq, error_detail(exc)
+                )
             image = None
         return image, plain
 
@@ -270,12 +277,21 @@ class Renderer:
 
     async def _render(self, template, data, umo, width, transparent):
         started = time.monotonic()
+        kind = (
+            "help"
+            if data.get("panel") == "help"
+            else "formula"
+            if "mathml" in data
+            else "card"
+        )
+        if self.log:
+            self.log.debug("render.begin kind=%s umo=%s width=%s", kind, umo, width)
         acquired = None
         try:
             async with asyncio.timeout(self.timeout):
                 async with self.limit:
                     acquired = time.monotonic()
-                    return await self.render(
+                    result = await self.render(
                         template,
                         data,
                         return_url=True,
@@ -290,6 +306,23 @@ class Renderer:
                             "scale": "css",
                         },
                     )
+                    if self.log:
+                        self.log.debug(
+                            "render.complete kind=%s umo=%s image_available=%s",
+                            kind,
+                            umo,
+                            bool(result),
+                        )
+                    return result
+        except Exception as exc:
+            if self.log:
+                self.log.error(
+                    "render.failed kind=%s umo=%s error=%s",
+                    kind,
+                    umo,
+                    error_detail(exc),
+                )
+            raise
         finally:
             ended = time.monotonic()
             if self.log:
