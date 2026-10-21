@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 SHANGHAI = timezone(timedelta(hours=8), "Asia/Shanghai")
 COMMAND = re.compile(r"^/?(g|ans)(?=\s|$)", re.ASCII)
 QQ = re.compile(r"^[1-9][0-9]{4,14}$", re.ASCII)
+GROUP_ID = re.compile(r"^[1-9][0-9]{4,14}$", re.ASCII)
 
 
 @dataclass(frozen=True)

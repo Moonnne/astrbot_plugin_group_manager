@@ -1,17 +1,17 @@
 """AstrBot entry point for scoped QQ group management."""
 
 import asyncio
-import re
 from pathlib import Path
 
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
 from .core.controller import Controller
+from .core.group_selection import GroupSelector
 from .core.onebot import OneBot
 from .core.rendering import Renderer
 from .core.repository import Repository
-from .models.domain import COMMAND, Scope
+from .models.domain import COMMAND, GROUP_ID, Scope
 
 
 class GroupManagerFilter(filter.CustomFilter):
@@ -43,9 +43,10 @@ class GroupManagerFilter(filter.CustomFilter):
 class GroupManager(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context, config)
-        self.config = config or {}
+        self.config = config if config is not None else {}
         self.controller = None
         self.repository = None
+        self.group_selector = GroupSelector(context, self.config, self.logger)
 
     async def initialize(self):
         root = Path(__file__).parent
@@ -59,9 +60,10 @@ class GroupManager(Star):
             group = str(value).strip()
             if not group:
                 continue
-            if not re.fullmatch(r"[1-9][0-9]{4,14}", group):
+            if not GROUP_ID.fullmatch(group):
                 raise ValueError("Invalid enabled group ID")
             enabled_groups.add(group)
+        self.config["enabled_groups"] = sorted(enabled_groups)
         api_timeout = int(self.config.get("api_timeout", 15))
         render_timeout = int(self.config.get("render_timeout", 25))
         if not 3 <= api_timeout <= 60 or not 5 <= render_timeout <= 120:
@@ -82,7 +84,10 @@ class GroupManager(Star):
                 enabled_groups=frozenset(enabled_groups),
             )
             await self.controller.start()
+            await self.group_selector.refresh()
         except BaseException:
+            if self.controller:
+                await self.controller.stop()
             await self.repository.close()
             raise
 
@@ -130,6 +135,7 @@ class GroupManager(Star):
     @filter.on_astrbot_loaded()
     async def loaded(self):
         if self.controller:
+            await self.group_selector.refresh()
             for row in await self.repository.all("groups"):
                 if not self.controller.allows_group(Scope.parse(row["scope"]).group):
                     continue
