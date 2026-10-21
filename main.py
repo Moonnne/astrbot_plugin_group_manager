@@ -26,12 +26,14 @@ class ScopeFilter(filter.CustomFilter):
 
     def filter(self, event, cfg):
         controller = self.runtime() if self.runtime else None
+        raw = event.message_obj.raw_message
         allowed = bool(
             controller
             and not controller.stopping
             and event.get_platform_name() == "aiocqhttp"
             and controller.allows_group(event.get_group_id())
-            and event.message_obj.raw_message.get("post_type") == "message"
+            and isinstance(raw, dict)
+            and raw.get("post_type") == "message"
         )
         if (
             controller
@@ -47,6 +49,18 @@ class ScopeFilter(filter.CustomFilter):
                 event.is_at_or_wake_command,
             )
         return allowed
+
+
+class GroupEventFilter(filter.CustomFilter):
+    def filter(self, event, cfg):
+        controller = ScopeFilter.runtime() if ScopeFilter.runtime else None
+        return bool(
+            controller
+            and not controller.stopping
+            and event.get_platform_name() == "aiocqhttp"
+            and controller.allows_group(event.get_group_id())
+            and GroupEvents.matches(event.message_obj.raw_message)
+        )
 
 
 class GroupCommandFilter(ScopeFilter):
@@ -164,10 +178,9 @@ class GroupManager(Star):
             )
             await self.controller.start()
             ScopeFilter.runtime = weakref.ref(self.controller)
-            self.events = GroupEvents(self.context, self.controller, self.logger)
-            self.events.bind_all()
+            self.events = GroupEvents(self.controller, self.logger)
             await self.group_selector.refresh()
-            self.logger.info("lifecycle.ready bindings=%s", len(self.events.bindings))
+            self.logger.info("lifecycle.ready event_entry=astrbot_group_handler")
         except BaseException as exc:
             self.logger.error("lifecycle.initialize_failed error=%s", error_detail(exc))
             await self.terminate()
@@ -289,6 +302,15 @@ class GroupManager(Star):
         # Also owns bare/invalid commands and literal /g when a different wake prefix is configured.
         await self.dispatch(event)
 
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=100)
+    @filter.custom_filter(GroupEventFilter, False)
+    async def event_monitoring(self, event: AstrMessageEvent):
+        """Handle native group requests and membership notices through AstrBot."""
+        if self.events:
+            event.should_call_llm(True)
+            self.events.receive(event)
+
     async def dispatch(self, event):
         self.logger.debug(
             "command.dispatch event=%s", event_summary(event.message_obj.raw_message)
@@ -337,19 +359,19 @@ class GroupManager(Star):
     @filter.on_platform_loaded()
     async def platform_loaded(self):
         self.logger.info(
-            "lifecycle.platform_loaded observer_ready=%s", bool(self.events)
+            "lifecycle.platform_loaded handler_ready=%s",
+            bool(self.events and not self.events.stopped),
         )
-        if self.events:
-            self.events.bind_all()
+        if self.controller and not self.controller.stopping:
             await self.group_selector.refresh()
 
     @filter.on_astrbot_loaded()
     async def loaded(self):
         self.logger.info(
-            "lifecycle.astrbot_loaded observer_ready=%s", bool(self.events)
+            "lifecycle.astrbot_loaded handler_ready=%s",
+            bool(self.events and not self.events.stopped),
         )
-        if self.events:
-            self.events.bind_all()
+        if self.controller and not self.controller.stopping:
             await self.group_selector.refresh()
 
     async def terminate(self):

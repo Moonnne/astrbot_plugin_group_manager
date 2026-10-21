@@ -78,12 +78,16 @@ SQLite 只有三张表：`group_members`、`group_list_entries`、`public_blackl
 ## 诊断日志
 
 插件数据目录的 `log/monitor.log` 保留最近 1000 行日志，重载时接续保留。时间为北京时间，UTF-8／CRLF。
-记录生命周期、平台与回调绑定、原生事件接收、群范围和宿主准入、命令解析与权限、队列／后台任务、设置读取与保存、数据库事务、审批状态、验证、渲染和 OneBot 调用结果。
+记录生命周期、AstrBot 群事件入口、群范围和宿主准入、命令解析与权限、队列／后台任务、设置读取与保存、数据库事务、审批状态、验证、渲染和 OneBot 调用结果。
 文件保留 DEBUG 详情，不依赖控制台日志级别；不改变宿主或其他插件的日志设置。每行最多 2000 字符，异步合并写入，卸载时等待刷新并结束写入线程。
 申请 flag 只记摘要，用于串联数据流；不记录完整申请理由、命令备注、图片数据或 token。错误详情做敏感字段脱敏。
 
 若申请无反应，重载后在目标群执行 `/g on`，再发起一条新的加群申请，随后执行 `/g y` 或 `/g n`，提供该日志用于定位。
-0.1.1 仅补充诊断记录；申请漏收的实际原因仍待现场日志确认，没有加入收件箱补收、监听重绑或新的审批重试策略。
+监听采用 AstrBot 正式群事件 Handler，从 `event.message_obj.raw_message` 读取申请和通知；参考 qqadmin 的事件接入方案。
+初始化记录 `event.handler_ready`，收到事件记录 `event.received entry=astrbot_group_handler`，随后可沿 queue、approval、verification 和 api 标签追踪。
+无需运行外部诊断包或修改 SnowLuma。身份无效、flag 超长、重复或过期事件只记录日志，不向群成员报错。
+扫码后 QQ 显示“群搜索”不影响处理规则；普通入群和邀请入群都依赖 `group_increase` 通知发起验证，不要求先收到申请事件。
+AstrBot 4.29.1 的唤醒前缀应使用非空值（如 `/`）；该版本在空前缀处理空消息链时存在已复现的宿主异常，发生在插件 Handler 之前。
 
 ## 图片和性能
 
@@ -100,7 +104,9 @@ SQLite 只有三张表：`group_members`、`group_list_entries`、`public_blackl
 
 ## 开发
 
-`main.py` 注册正式 g 指令组、ans 和生命周期；`core/` 负责业务与适配器接入；`models/` 每种纯数据模型独立文件；`utils/` 负责数据库基础工具和会话编码。
+`main.py` 注册正式 g 指令组、ans、群事件和生命周期；`core/` 负责事件校验、业务编排与适配器调用；`models/` 每种纯数据模型独立文件；`utils/` 负责数据库基础工具和会话编码。
 SQL 与 Jinja2 模板位于 `resource/`，隔离测试位于 `test/`。运行时不依赖浏览器，Playwright 仅用于本地合成预览。
+
+后续功能统一使用 AstrBot 正式事件注册与适配器公开接口。OneBot 动作经宿主平台实例的 `get_client()` 入口调用；不自行创建 CQHttp 客户端、订阅底层事件或直连协议端。
 
 详见本地开发文档 [DEV.md](docs/DEV.md)、[ASTRBOT.md](docs/ASTRBOT.md)、[SNOWLUMA.md](docs/SNOWLUMA.md)；docs 按现有仓库规则忽略。

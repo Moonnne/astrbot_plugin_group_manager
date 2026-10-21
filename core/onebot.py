@@ -1,4 +1,4 @@
-"""OneBot access, capability fallbacks, and verified message routing."""
+"""OneBot actions through AstrBot's platform adapter and account routing."""
 
 import asyncio
 import time
@@ -25,7 +25,7 @@ class OneBot:
                 self.profiles.pop(key)
 
     async def call(self, scope, action, **params):
-        """Route through CQHttp's explicit account selection.
+        """Use the AstrBot OneBot adapter and select the original account.
 
         Args:
             scope: Persisted platform, bot account, and group identity.
@@ -33,7 +33,7 @@ class OneBot:
             **params: Validated action parameters.
 
         Returns:
-            The action data returned by aiocqhttp.
+            The action data returned by the platform adapter's client.
 
         Raises:
             RuntimeError: The requested OneBot platform is unavailable.

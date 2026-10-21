@@ -1,6 +1,6 @@
 """Exercise real AstrBot conversion/wake processing and CQHttp dispatch."""
 
-import asyncio
+import logging
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,26 +8,17 @@ from unittest.mock import AsyncMock
 
 import pytest
 from aiocqhttp import Event
+from host import adapter
 from monitor_plugin.core.events import GroupEvents
 from monitor_plugin.core.rendering import Renderer
 from monitor_plugin.main import GroupManager, ScopeFilter
 
+from astrbot.api.platform import MessageType
 from astrbot.core.config.default import DEFAULT_CONFIG
 from astrbot.core.pipeline.waking_check.stage import WakingCheckStage
-from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_platform_adapter import (
-    AiocqhttpAdapter,
-)
 from astrbot.core.star.star import star_map
 
 pytestmark = pytest.mark.asyncio
-
-
-def adapter():
-    return AiocqhttpAdapter(
-        {"id": "onebot", "ws_reverse_host": "127.0.0.1", "ws_reverse_port": 0},
-        {},
-        asyncio.Queue(),
-    )
 
 
 async def test_real_star_html_render_contract():
@@ -116,12 +107,15 @@ async def test_real_wake_and_registered_handlers_keep_invalid_commands_silent(
         ScopeFilter.runtime = None
 
 
-async def test_empty_notice_breaks_chat_wake_but_native_observer_still_verifies(env):
+@pytest.mark.parametrize("subtype", ["approve", "invite"])
+async def test_host_empty_wake_prefix_rejects_notice_before_group_handlers(
+    env, subtype
+):
     platform = adapter()
     payload = {
         "post_type": "notice",
         "notice_type": "group_increase",
-        "sub_type": "approve",
+        "sub_type": subtype,
         "self_id": 99999,
         "user_id": 20001,
         "group_id": 12345,
@@ -138,26 +132,70 @@ async def test_empty_notice_breaks_chat_wake_but_native_observer_still_verifies(
     )
     with pytest.raises(IndexError):
         await stage.process(event)
-    await env.settings.update(env.scope, "10001", env.clock(), enabled=True)
-    await env.c.start()
-    observer = GroupEvents(SimpleNamespace(), env.c, env.c.log)
-    observer.bind(platform)
-    observer.bind(platform)
-    assert len(observer.bindings) == 3
-    try:
-        await platform.get_client()._handle_event(payload)
-        await env.c.queue.join()
-        await asyncio.gather(*env.c.background)
-        assert any(
-            image == "https://example.test/formula.png"
-            for _, _, image, _ in env.api.sent
-        )
-        assert (await env.db.member(env.scope, "20001"))["verification"] == "waiting"
-    finally:
-        observer.stop()
-    assert not observer.bindings
-    await platform.get_client()._handle_event({**payload, "user_id": 20002})
-    assert env.c.queue.empty()
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"post_type": "request", "request_type": "group", "sub_type": "add"},
+        {
+            "post_type": "request",
+            "request_type": "group",
+            "sub_type": "invite",
+            "invited_id": 20002,
+        },
+        {
+            "post_type": "notice",
+            "notice_type": "group_increase",
+            "sub_type": "approve",
+        },
+        {
+            "post_type": "notice",
+            "notice_type": "group_increase",
+            "sub_type": "invite",
+        },
+        {
+            "post_type": "notice",
+            "notice_type": "group_decrease",
+            "sub_type": "leave",
+        },
+    ],
+)
+async def test_group_handler_preserves_native_wire_fields(fields):
+    platform = adapter()
+    received = []
+    events = GroupEvents(
+        SimpleNamespace(
+            stopping=False,
+            allows_group=lambda group: group == "12345",
+            enqueue=lambda scope, raw: received.append((scope, raw)),
+        ),
+        logging.getLogger("monitor-contract"),
+    )
+    payload = {
+        "self_id": 99999,
+        "user_id": 20001,
+        "group_id": 12345,
+        "operator_id": 10001,
+        "time": 1800000000,
+        "flag": "opaque-request-handle",
+        "comment": "Synthetic applicant message",
+        **fields,
+    }
+    await platform.get_client()._handle_event(payload)
+    host_event = platform._event_queue.get_nowait()
+    events.receive(host_event)
+    assert host_event.message_obj.type == MessageType.GROUP_MESSAGE
+    assert not host_event.message_str and not host_event.get_messages()
+    assert len(received) == 1
+    scope, raw = received[0]
+    assert (scope.platform, scope.bot, scope.group) == (
+        "onebot",
+        "99999",
+        "12345",
+    )
+    assert raw == host_event.message_obj.raw_message == payload
+    assert platform._event_queue.empty()
 
 
 async def test_plugin_data_layout_and_shutdown_are_isolated():
@@ -179,32 +217,27 @@ async def test_plugin_data_layout_and_shutdown_are_isolated():
     assert not ScopeFilter.runtime
 
 
-async def test_removed_adapter_subscriptions_are_released(env):
-    first, second = adapter(), adapter()
-    platforms = [first]
-    observer = GroupEvents(
-        SimpleNamespace(platform_manager=SimpleNamespace(platform_insts=platforms)),
-        env.c,
-        env.c.log,
+async def test_stopped_group_handler_rejects_new_events(env):
+    platform = adapter()
+    events = GroupEvents(env.c, env.c.log)
+    events.stop()
+    event = platform.create_event(
+        await platform.convert_message(
+            Event(
+                {
+                    "post_type": "notice",
+                    "notice_type": "group_increase",
+                    "sub_type": "approve",
+                    "self_id": 99999,
+                    "group_id": 12345,
+                    "user_id": 20001,
+                    "time": int(env.clock()),
+                }
+            )
+        )
     )
-    observer.bind_all()
-    platforms[:] = [second]
-    observer.bind_all()
-    assert len(observer.bindings) == 3
-    assert all(client is second.get_client() for client, _, _ in observer.bindings)
-    await first.get_client()._handle_event(
-        {
-            "post_type": "notice",
-            "notice_type": "group_increase",
-            "sub_type": "approve",
-            "self_id": 99999,
-            "group_id": 12345,
-            "user_id": 20001,
-            "time": int(env.clock()),
-        }
-    )
+    events.receive(event)
     assert env.c.queue.empty()
-    observer.stop()
 
 
 @pytest.mark.parametrize(

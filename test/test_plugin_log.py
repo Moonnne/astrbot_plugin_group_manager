@@ -74,14 +74,14 @@ async def test_plugin_log_initializes_and_flushes_at_unload():
 
 
 @pytest.mark.asyncio
-async def test_native_request_to_approval_has_a_complete_log_trace():
+async def test_group_handler_request_to_approval_has_a_complete_log_trace():
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
+    from host import adapter, run_handlers, settle
     from monitor_plugin.core.rules import parse_command
     from monitor_plugin.main import GroupManager
     from monitor_plugin.models.scope import Scope
-    from test_host_contract import adapter
 
     platform = adapter()
     client = platform.get_client()
@@ -139,15 +139,14 @@ async def test_native_request_to_approval_has_a_complete_log_trace():
                 "comment": "do-not-log-reason",
             }
         )
-        await plugin.controller.queue.join()
-        await asyncio.gather(*list(plugin.controller.background))
+        await run_handlers(plugin, platform._event_queue.get_nowait())
+        await settle(plugin.controller)
         await plugin.controller.command(scope, "10001", parse_command("/g y"))
     finally:
         await plugin.terminate()
     output = sink.path.read_text(encoding="utf-8")
     for marker in (
-        "event.inventory",
-        "event.subscribed",
+        "event.handler_ready",
         "event.received",
         "queue.enqueued",
         "queue.dequeued",
