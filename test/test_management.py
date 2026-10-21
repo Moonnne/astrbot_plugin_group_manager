@@ -1,6 +1,7 @@
 """Behavioral tests for moderation, isolation, persistence, and races."""
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 from monitor_plugin.models.domain import Scope, parse_command
@@ -558,3 +559,79 @@ async def test_approval_operation_time_is_successful_completion(env, fail):
     e.renderer.card = capture_card
     await command(e, "/g info 20001")
     assert observed[0]["decided_at"] == row["decided_at"]
+
+
+async def test_group_scope_blocks_commands_events_and_member_snapshots(env):
+    e = env
+    other = Scope("onebot", "99999", "54321")
+    for raw, text in (
+        ({"post_type": "message"}, "/g on"),
+        ({"post_type": "request", "request_type": "group"}, ""),
+        ({"post_type": "notice", "notice_type": "group_increase"}, ""),
+    ):
+        await e.c.handle(other, "outside", raw, "10000", text, True)
+    await command(e, "/g help", actor="10000", superuser=True, scope=other)
+    e.api.call = AsyncMock(return_value=[])
+    await e.c.sync_members(other)
+    e.api.call.assert_not_called()
+    assert not await e.db.one("settings", {"scope": other.key})
+    assert not e.api.sent and not e.api.kicks and not e.api.approvals
+
+
+@pytest.mark.parametrize("waiting", [False, True])
+async def test_excluded_group_cannot_deliver_or_expire_verification(env, waiting):
+    e = env
+    await enable(e)
+    await join(e)
+    row = await challenge(e)
+    if waiting:
+        await e.c.verification.deliver(row)
+        e.clock.now += 601
+    e.api.sent.clear()
+    e.c.enabled_groups = frozenset()
+    await (e.c.verification.expire(row) if waiting else e.c.verification.deliver(row))
+    assert not e.api.sent and not e.api.kicks
+    assert (await challenge(e))["state"] == ("waiting" if waiting else "delivery")
+
+
+async def test_reload_removes_group_tasks_and_retains_history(env):
+    e = env
+    await enable(e)
+    await request(e)
+    await request(e, "20002")
+    await command(e, "/g y")
+    await join(e, "20003")
+    row = await challenge(e, "20003")
+    await e.c.verification.deliver(row)
+    e.api.sent.clear()
+    replacement = type(e.c)(
+        e.db,
+        e.api,
+        e.renderer,
+        e.c.host_admin,
+        e.c.log,
+        e.clock,
+        enabled_groups=frozenset(),
+    )
+    await replacement.start()
+    try:
+        await asyncio.sleep(0)
+        settings = await e.db.one("settings", {"scope": e.scope.key})
+        assert not settings["enabled"]
+        assert not await e.db.all("pending", {"scope": e.scope.key, "now": e.clock()})
+        assert (
+            await e.db.one(
+                "request_by_flag", {"scope": e.scope.key, "flag": "flag-20001"}
+            )
+        )["status"] == "abandoned"
+        assert (await e.db.one("challenge_id", {"id": row["id"]}))[
+            "state"
+        ] == "cancelled"
+        snapshot = await e.db.one(
+            "latest_snapshot", {"scope": e.scope.key, "actor": "10001"}
+        )
+        assert not snapshot["active"]
+        assert await e.db.one("member", {"scope": e.scope.key, "qq": "20003"})
+        assert not e.api.sent and not e.api.kicks
+    finally:
+        await replacement.stop()

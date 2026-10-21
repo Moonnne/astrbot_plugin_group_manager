@@ -1,4 +1,11 @@
 {
+  "enabled_groups": {
+    "description": "启用群组",
+    "type": "list",
+    "items": { "type": "string" },
+    "default": [],
+    "hint": "添加允许启用插件的 QQ 群号，每项一个，仅填写数字。留空时不启用任何群。保存并重载后生效；列入后仍需在群内发送 /g on 开启审批与验证。移出列表会停止该群待办，保留历史数据。"
+  },
   "api_timeout": {
     "description": "OneBot 接口超时",
     "type": "int",

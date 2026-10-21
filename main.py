@@ -1,6 +1,7 @@
 """AstrBot entry point for scoped QQ group management."""
 
 import asyncio
+import re
 from pathlib import Path
 
 from astrbot.api.event import AstrMessageEvent, filter
@@ -48,6 +49,19 @@ class GroupManager(Star):
 
     async def initialize(self):
         root = Path(__file__).parent
+        groups = self.config.get("enabled_groups", [])
+        if not isinstance(groups, list):
+            raise ValueError("Enabled groups must be a list of QQ group IDs")
+        enabled_groups = set()
+        for value in groups:
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                raise ValueError("Invalid enabled group ID")
+            group = str(value).strip()
+            if not group:
+                continue
+            if not re.fullmatch(r"[1-9][0-9]{4,14}", group):
+                raise ValueError("Invalid enabled group ID")
+            enabled_groups.add(group)
         api_timeout = int(self.config.get("api_timeout", 15))
         render_timeout = int(self.config.get("render_timeout", 25))
         if not 3 <= api_timeout <= 60 or not 5 <= render_timeout <= 120:
@@ -65,6 +79,7 @@ class GroupManager(Star):
                 Renderer(self.html_render, root / "resource/templates", render_timeout),
                 self.is_host_admin,
                 self.logger,
+                enabled_groups=frozenset(enabled_groups),
             )
             await self.controller.start()
         except BaseException:
@@ -79,12 +94,14 @@ class GroupManager(Star):
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     @filter.custom_filter(GroupManagerFilter, False)
     async def receive(self, event: AstrMessageEvent):
+        if not self.controller or not self.controller.allows_group(
+            event.get_group_id()
+        ):
+            return
         raw = event.message_obj.raw_message
         if raw.get("post_type") == "message":
             event.should_call_llm(True)
             event.stop_event()
-        if not self.controller or not event.get_group_id():
-            return
         scope = Scope(
             event.get_platform_id(), event.get_self_id(), event.get_group_id()
         )
@@ -114,6 +131,8 @@ class GroupManager(Star):
     async def loaded(self):
         if self.controller:
             for row in await self.repository.all("groups"):
+                if not self.controller.allows_group(Scope.parse(row["scope"]).group):
+                    continue
                 self.controller.spawn(
                     self.controller.sync_members(Scope.parse(row["scope"]))
                 )

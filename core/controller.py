@@ -4,17 +4,26 @@ import asyncio
 import time
 from collections import defaultdict
 
-from ..models.domain import display_time, parse_command
+from ..models.domain import Scope, display_time, parse_command
 from .approval import Approval
 from .verification import Verification
 
 
 class Controller:
     def __init__(
-        self, repository, gateway, renderer, host_admin, logger, clock=time.time
+        self,
+        repository,
+        gateway,
+        renderer,
+        host_admin,
+        logger,
+        clock=time.time,
+        *,
+        enabled_groups=frozenset(),
     ):
         self.db, self.api, self.renderer = repository, gateway, renderer
         self.host_admin, self.log, self.clock = host_admin, logger, clock
+        self.enabled_groups = frozenset(enabled_groups)
         self.locks = defaultdict(asyncio.Lock)
         self.approval = Approval(repository, gateway, clock, logger)
         self.verification = Verification(self)
@@ -23,7 +32,14 @@ class Controller:
         self.timer = None
         self.scheduled = set()
 
+    def allows_group(self, group):
+        return group in self.enabled_groups
+
     async def start(self):
+        for row in await self.db.all("groups"):
+            scope = Scope.parse(row["scope"])
+            if not self.allows_group(scope.group):
+                await self.disable(scope, scope.bot)
         await self.db.batch(
             [
                 ("recover_requests", {}),
@@ -60,6 +76,8 @@ class Controller:
             try:
                 await self.db.execute("expire_requests", {"now": self.clock()})
                 for row in await self.db.all("active_challenges"):
+                    if not self.allows_group(Scope.parse(row["scope"]).group):
+                        continue
                     if row["id"] in self.scheduled:
                         continue
                     if (
@@ -83,7 +101,7 @@ class Controller:
             await asyncio.sleep(5)
 
     async def handle(self, scope, umo, raw, actor, text="", superuser=False):
-        if self.stopping:
+        if self.stopping or not self.allows_group(scope.group):
             return
         p = {"scope": scope.key, "umo": umo, "now": self.clock(), "actor": actor}
         await self.db.execute("ensure_group", p)
@@ -127,6 +145,8 @@ class Controller:
             cmd: Parsed command with validated arguments.
             superuser: Host administrator status from the original event.
         """
+        if not self.allows_group(scope.group):
+            return
         if cmd.verb == "help":
             settings = await self.db.one("settings", {"scope": scope.key})
             image, plain = await self.renderer.help(self.clock(), settings["umo"])
@@ -366,6 +386,8 @@ class Controller:
             await self.api.send(scope, title if image else plain, image=image)
 
     async def sync_members(self, scope):
+        if not self.allows_group(scope.group):
+            return
         try:
             members = await self.api.call(
                 scope, "get_group_member_list", group_id=int(scope.group)

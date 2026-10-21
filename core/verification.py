@@ -168,6 +168,8 @@ class Verification:
             initial: Persisted challenge selected by the scheduler.
         """
         scope = Scope.parse(initial["scope"])
+        if not self.c.allows_group(scope.group):
+            return
         async with self.c.locks[scope.key]:
             row = await self.db.one("challenge_id", {"id": initial["id"]})
             settings = await self.db.one("settings", {"scope": scope.key})
@@ -264,6 +266,8 @@ class Verification:
             initial: Persisted challenge selected by the scheduler.
         """
         scope = Scope.parse(initial["scope"])
+        if not self.c.allows_group(scope.group):
+            return
         async with self.c.locks[scope.key]:
             row = await self.db.one("challenge_id", {"id": initial["id"]})
             settings = await self.db.one("settings", {"scope": scope.key})

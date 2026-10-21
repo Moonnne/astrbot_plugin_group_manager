@@ -4,7 +4,7 @@ import asyncio
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiocqhttp import Event
@@ -185,3 +185,52 @@ async def test_real_plugin_initialization_and_shutdown_use_isolated_data():
     await plugin.terminate()
     assert repository.db is None
     assert timer.done() and not plugin.controller.background
+
+
+async def test_enabled_groups_normalize_ids_and_default_to_none():
+    context = SimpleNamespace(get_config=lambda umo=None: {"admins_id": []})
+    for config, expected in (
+        ({}, frozenset()),
+        (
+            {"enabled_groups": [" 12345 ", 12345, "", "54321"]},
+            frozenset({"12345", "54321"}),
+        ),
+    ):
+        plugin = GroupManager(context, config)
+        await plugin.initialize()
+        try:
+            assert plugin.controller.enabled_groups == expected
+            assert not plugin.controller.allows_group("")
+            assert not plugin.controller.allows_group("99998")
+        finally:
+            await plugin.terminate()
+
+
+@pytest.mark.parametrize(
+    "groups", ["12345", [True], [1.5], ["0012345"], ["群号"], [{}]]
+)
+async def test_invalid_enabled_groups_fail_before_opening_data(groups):
+    plugin = GroupManager(
+        SimpleNamespace(get_config=lambda umo=None: {}), {"enabled_groups": groups}
+    )
+    with pytest.raises(ValueError):
+        await plugin.initialize()
+    assert plugin.repository is None
+
+
+@pytest.mark.parametrize("post", ["message", "request", "notice"])
+async def test_outside_group_does_not_intercept_or_create_records(env, post):
+    event = SimpleNamespace(
+        message_obj=SimpleNamespace(raw_message={"post_type": post}),
+        message_str="/g on",
+        get_group_id=lambda: "54321",
+        should_call_llm=Mock(),
+        stop_event=Mock(),
+    )
+    plugin = object.__new__(GroupManager)
+    plugin.controller = env.c
+    await plugin.receive(event)
+    event.should_call_llm.assert_not_called()
+    event.stop_event.assert_not_called()
+    assert not env.api.sent
+    assert len(await env.db.all("groups")) == 1

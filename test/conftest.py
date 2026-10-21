@@ -116,6 +116,7 @@ async def env():
         lambda qq, umo: qq == "10000",
         logging.getLogger("monitor-test"),
         clock,
+        enabled_groups={"12345"},
     )
     scope = Scope("onebot", "99999", "12345")
     await db.execute(
