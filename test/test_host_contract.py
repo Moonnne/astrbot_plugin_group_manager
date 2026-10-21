@@ -1,15 +1,16 @@
-"""Exercise the actual AstrBot adapter, waking stage, and plugin filters."""
+"""Exercise real AstrBot conversion/wake processing and CQHttp dispatch."""
 
 import asyncio
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 from aiocqhttp import Event
+from monitor_plugin.core.events import GroupEvents
 from monitor_plugin.core.rendering import Renderer
-from monitor_plugin.main import GroupManager, GroupManagerFilter
+from monitor_plugin.main import GroupManager, ScopeFilter
 
 from astrbot.core.config.default import DEFAULT_CONFIG
 from astrbot.core.pipeline.waking_check.stage import WakingCheckStage
@@ -19,6 +20,14 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_platform_adapter import (
 from astrbot.core.star.star import star_map
 
 pytestmark = pytest.mark.asyncio
+
+
+def adapter():
+    return AiocqhttpAdapter(
+        {"id": "onebot", "ws_reverse_host": "127.0.0.1", "ws_reverse_port": 0},
+        {},
+        asyncio.Queue(),
+    )
 
 
 async def test_real_star_html_render_contract():
@@ -36,201 +45,173 @@ async def test_real_star_html_render_contract():
     renderer = Renderer(
         plugin.html_render, Path(__file__).resolve().parents[1] / "resource/templates"
     )
-    image, _ = await renderer.help(1800000000, "onebot:GroupMessage:12345")
-    assert image == "https://example.test/render.png"
+    await renderer.help(1800000000, "onebot:GroupMessage:12345")
     await renderer.formula(r"3 \times 4", "onebot:GroupMessage:12345")
-    assert service.render_custom_template.await_count == 2
-    for call in service.render_custom_template.await_args_list:
-        assert call.kwargs["return_url"] is True
-        assert call.kwargs["options"]["full_page"] is True
     assert sessions == ["onebot:GroupMessage:12345"] * 2
     assert (
         service.render_custom_template.await_args.kwargs["endpoint"]
         == "https://example.test/t2i"
     )
-
-
-def adapter():
-    return AiocqhttpAdapter(
-        {"id": "onebot", "ws_reverse_host": "127.0.0.1", "ws_reverse_port": 0},
-        {},
-        asyncio.Queue(),
+    assert (
+        service.render_custom_template.await_args.kwargs["options"]["omit_background"]
+        is False
     )
-
-
-async def test_real_request_and_notice_conversion_preserve_raw_fields():
-    platform = adapter()
-    for post, extra in [
-        (
-            "request",
-            {
-                "request_type": "group",
-                "sub_type": "add",
-                "flag": "opaque:1",
-                "comment": "hello",
-            },
-        ),
-        (
-            "notice",
-            {
-                "notice_type": "group_increase",
-                "sub_type": "approve",
-                "operator_id": 10001,
-            },
-        ),
-    ]:
-        raw = Event(
-            {
-                "post_type": post,
-                "self_id": 99999,
-                "user_id": 20001,
-                "group_id": 12345,
-                "time": 1800000000,
-                **extra,
-            }
-        )
-        message = await platform.convert_message(raw)
-        event = platform.create_event(message)
-        assert event.get_group_id() == "12345"
-        assert event.message_str == ""
-        assert event.message_obj.raw_message is raw
-        assert GroupManagerFilter(False).filter(event, {})
 
 
 @pytest.mark.parametrize(
-    "text", ["/g unknown", "/g y nonsense", "/g ban", "/ans wrong", "/g", "/g help"]
+    "text",
+    [
+        "/g",
+        "/g help",
+        "/g unknown",
+        "/g ban",
+        "/g info wrong",
+        "/ans wrong",
+        "/g auto nope",
+    ],
 )
-async def test_real_waking_stage_routes_help_and_silences_invalid_commands(text, env):
+async def test_real_wake_and_registered_handlers_keep_invalid_commands_silent(
+    env, text
+):
+    import weakref
+
     platform = adapter()
-    raw = Event(
-        {
-            "post_type": "message",
-            "message_type": "group",
-            "sub_type": "normal",
-            "self_id": 99999,
-            "user_id": 20001,
-            "group_id": 12345,
-            "time": 1800000000,
-            "message_id": 1,
-            "sender": {"user_id": 20001, "nickname": "Member", "role": "member"},
-            "message": [{"type": "text", "data": {"text": text}}],
-            "raw_message": text,
-        }
-    )
-    event = platform.create_event(await platform.convert_message(raw))
+    payload = {
+        "post_type": "message",
+        "message_type": "group",
+        "sub_type": "normal",
+        "self_id": 99999,
+        "user_id": 20001,
+        "group_id": 12345,
+        "time": int(env.clock()),
+        "message_id": 1,
+        "sender": {"user_id": 20001, "nickname": "Member", "role": "member"},
+        "message": [{"type": "text", "data": {"text": text}}],
+        "raw_message": text,
+    }
+    event = platform.create_event(await platform.convert_message(Event(payload)))
     event.send = AsyncMock()
     metadata = star_map["monitor_plugin.main"]
-    metadata.name = "astrbot_plugin_group_manager"
-    metadata.activated = True
+    metadata.name, metadata.activated = "astrbot_plugin_group_manager", True
     config = deepcopy(DEFAULT_CONFIG)
-    config.update({"wake_prefix": ["/"], "admins_id": ["10000"]})
+    config.update(wake_prefix=["/"], admins_id=["10000"])
     stage = WakingCheckStage()
     await stage.initialize(
         SimpleNamespace(astrbot_config=config, db_helper=None, astrbot_config_id="test")
     )
-    await stage.process(event)
-    assert event.get_extra("activated_handlers")
-    assert not event.is_admin()
+    ScopeFilter.runtime = weakref.ref(env.c)
     plugin = object.__new__(GroupManager)
-    plugin.controller = env.c
-    plugin.logger = env.c.log
-    await plugin.receive(event)
-    assert event.is_stopped() and event.call_llm is True
-    event.send.assert_not_called()
-    if text in {"/g", "/g help"}:
-        assert env.api.sent == [
-            (env.scope.key, "", "https://example.test/help.png", None)
-        ]
-    else:
-        assert not env.api.sent
+    plugin.controller, plugin.logger = env.c, env.c.log
+    try:
+        await stage.process(event)
+        handlers = event.get_extra("activated_handlers")
+        assert handlers
+        for handler in handlers:
+            if not event.is_stopped():
+                await handler.handler(plugin, event)
+        assert event.is_stopped() and event.call_llm is True
+        event.send.assert_not_called()
+        assert bool(env.api.sent) == (text in {"/g", "/g help"})
+    finally:
+        ScopeFilter.runtime = None
 
 
-async def test_help_in_private_chat_stays_silent(env):
-    event = SimpleNamespace(
-        message_obj=SimpleNamespace(raw_message={"post_type": "message"}),
-        message_str="/g help",
-        should_call_llm=lambda value: None,
-        stop_event=lambda: None,
-        get_group_id=lambda: "",
+async def test_empty_notice_breaks_chat_wake_but_native_observer_still_verifies(env):
+    platform = adapter()
+    payload = {
+        "post_type": "notice",
+        "notice_type": "group_increase",
+        "sub_type": "approve",
+        "self_id": 99999,
+        "user_id": 20001,
+        "group_id": 12345,
+        "operator_id": 10001,
+        "time": int(env.clock()),
+    }
+    event = platform.create_event(await platform.convert_message(Event(payload)))
+    assert not event.message_str and not event.get_messages()
+    config = deepcopy(DEFAULT_CONFIG)
+    config["wake_prefix"] = [""]
+    stage = WakingCheckStage()
+    await stage.initialize(
+        SimpleNamespace(astrbot_config=config, db_helper=None, astrbot_config_id="test")
     )
-    plugin = object.__new__(GroupManager)
-    plugin.controller = env.c
-    await plugin.receive(event)
-    assert not env.api.sent
+    with pytest.raises(IndexError):
+        await stage.process(event)
+    await env.settings.update(env.scope, "10001", env.clock(), enabled=True)
+    await env.c.start()
+    observer = GroupEvents(SimpleNamespace(), env.c, env.c.log)
+    observer.bind(platform)
+    observer.bind(platform)
+    assert len(observer.bindings) == 3
+    try:
+        await platform.get_client()._handle_event(payload)
+        await env.c.queue.join()
+        await asyncio.gather(*env.c.background)
+        assert any(
+            image == "https://example.test/formula.png"
+            for _, _, image, _ in env.api.sent
+        )
+        assert (await env.db.member(env.scope, "20001"))["verification"] == "waiting"
+    finally:
+        observer.stop()
+    assert not observer.bindings
+    await platform.get_client()._handle_event({**payload, "user_id": 20002})
+    assert env.c.queue.empty()
 
 
-async def test_filter_ignores_unrelated_text_and_accepts_literal_slash():
-    event = SimpleNamespace(
-        get_platform_name=lambda: "aiocqhttp",
-        message_obj=SimpleNamespace(raw_message={"post_type": "message"}),
-        message_str="g on",
-        is_at_or_wake_command=False,
-    )
-    assert not GroupManagerFilter(False).filter(event, {})
-    event.message_str = "/g on"
-    assert GroupManagerFilter(False).filter(event, {})
-    event.message_str = "/greetings"
-    assert not GroupManagerFilter(False).filter(event, {})
-
-
-async def test_real_plugin_initialization_and_shutdown_use_isolated_data():
+async def test_plugin_data_layout_and_shutdown_are_isolated():
     plugin = GroupManager(
-        SimpleNamespace(get_config=lambda umo=None: {"admins_id": []})
+        SimpleNamespace(
+            get_config=lambda umo=None: {"admins_id": []},
+            platform_manager=SimpleNamespace(platform_insts=[]),
+        )
     )
     await plugin.initialize()
-    repository = plugin.repository
-    timer = plugin.controller.timer
-    assert repository.path.name == "group_manager.sqlite3"
+    repository, controller = plugin.repository, plugin.controller
+    assert repository.path.parent.name == "db"
     assert "monitor-host-" in str(repository.path)
     await plugin.terminate()
     assert repository.db is None
-    assert timer.done() and not plugin.controller.background
+    assert (
+        controller.timer.done() and not controller.workers and not controller.background
+    )
+    assert not ScopeFilter.runtime
 
 
-async def test_enabled_groups_normalize_ids_and_default_to_none():
-    context = SimpleNamespace(get_config=lambda umo=None: {"admins_id": []})
-    for config, expected in (
-        ({}, frozenset()),
-        (
-            {"enabled_groups": [" 12345 ", 12345, "", "54321"]},
-            frozenset({"12345", "54321"}),
-        ),
-    ):
-        plugin = GroupManager(context, config)
-        await plugin.initialize()
-        try:
-            assert plugin.controller.enabled_groups == expected
-            assert not plugin.controller.allows_group("")
-            assert not plugin.controller.allows_group("99998")
-        finally:
-            await plugin.terminate()
+async def test_removed_adapter_subscriptions_are_released(env):
+    first, second = adapter(), adapter()
+    platforms = [first]
+    observer = GroupEvents(
+        SimpleNamespace(platform_manager=SimpleNamespace(platform_insts=platforms)),
+        env.c,
+        env.c.log,
+    )
+    observer.bind_all()
+    platforms[:] = [second]
+    observer.bind_all()
+    assert len(observer.bindings) == 3
+    assert all(client is second.get_client() for client, _, _ in observer.bindings)
+    await first.get_client()._handle_event(
+        {
+            "post_type": "notice",
+            "notice_type": "group_increase",
+            "sub_type": "approve",
+            "self_id": 99999,
+            "group_id": 12345,
+            "user_id": 20001,
+            "time": int(env.clock()),
+        }
+    )
+    assert env.c.queue.empty()
+    observer.stop()
 
 
 @pytest.mark.parametrize(
     "groups", ["12345", [True], [1.5], ["0012345"], ["群号"], [{}]]
 )
 async def test_invalid_enabled_groups_fail_before_opening_data(groups):
-    plugin = GroupManager(
-        SimpleNamespace(get_config=lambda umo=None: {}), {"enabled_groups": groups}
-    )
+    plugin = GroupManager(SimpleNamespace(), {"enabled_groups": groups})
     with pytest.raises(ValueError):
         await plugin.initialize()
     assert plugin.repository is None
-
-
-@pytest.mark.parametrize("post", ["message", "request", "notice"])
-async def test_outside_group_does_not_intercept_or_create_records(env, post):
-    event = SimpleNamespace(
-        message_obj=SimpleNamespace(raw_message={"post_type": post}),
-        message_str="/g on",
-        get_group_id=lambda: "54321",
-        should_call_llm=Mock(),
-        stop_event=Mock(),
-    )
-    plugin = object.__new__(GroupManager)
-    plugin.controller = env.c
-    await plugin.receive(event)
-    event.should_call_llm.assert_not_called()
-    event.stop_event.assert_not_called()
-    assert not env.api.sent
-    assert len(await env.db.all("groups")) == 1

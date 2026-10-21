@@ -1,37 +1,15 @@
-"""Pure domain rules and wire-independent values."""
+"""Command parsing, moderation policy, arithmetic, and display rules."""
 
-import json
 import random
 import re
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+
+from ..models.command import Command
 
 SHANGHAI = timezone(timedelta(hours=8), "Asia/Shanghai")
 COMMAND = re.compile(r"^/?(g|ans)(?=\s|$)", re.ASCII)
 QQ = re.compile(r"^[1-9][0-9]{4,14}$", re.ASCII)
 GROUP_ID = re.compile(r"^[1-9][0-9]{4,14}$", re.ASCII)
-
-
-@dataclass(frozen=True)
-class Scope:
-    platform: str
-    bot: str
-    group: str
-
-    @property
-    def key(self) -> str:
-        return json.dumps([self.platform, self.bot, self.group], separators=(",", ":"))
-
-    @classmethod
-    def parse(cls, key: str) -> "Scope":
-        return cls(*json.loads(key))
-
-
-@dataclass(frozen=True)
-class Command:
-    verb: str
-    target: str = ""
-    note: str = ""
 
 
 def parse_command(text: str) -> Command | None:

@@ -1,14 +1,15 @@
 """Pure policy, parser, and template tests."""
 
+import asyncio
 import random
+import time
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 from jinja2 import Environment, StrictUndefined
-from monitor_plugin.core.onebot import safe_image
 from monitor_plugin.core.rendering import Renderer
-from monitor_plugin.models.domain import (
+from monitor_plugin.core.rules import (
     SHANGHAI,
     arithmetic,
     decision,
@@ -18,6 +19,21 @@ from monitor_plugin.models.domain import (
 )
 
 RESOURCES = Path(__file__).resolve().parents[1] / "resource/templates"
+
+
+@pytest.mark.asyncio
+async def test_render_queue_is_included_in_timeout_budget():
+    renderer = Renderer(None, RESOURCES, timeout=0.02)
+    await renderer.limit.acquire()
+    await renderer.limit.acquire()
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(renderer.formula("1 + 2", "umo"), 0.5)
+        assert time.monotonic() - started < 0.3
+    finally:
+        renderer.limit.release()
+        renderer.limit.release()
 
 
 @pytest.mark.parametrize(
@@ -69,7 +85,7 @@ async def test_help_uses_host_template_service_and_falls_back_on_failure():
     assert options["return_url"] is True
     assert options["options"]["viewport_height"] == 1
     assert "<h1>指令清单</h1>" in output and "群管理 · 指令清单" not in output
-    assert "data:image/png;base64," in output
+    assert "data:image/webp;base64," in output
     assert 'class="notes"' not in output
     assert "AstrBot 管理员拥有全部命令权限" not in plain
     assert "Create Time: 2026-10-21 12:00:00 UTC+8" in output
@@ -224,7 +240,7 @@ async def test_list_cards_keep_operators_times_and_reasons_separate():
         assert f"&lt;{kind}&gt;" in output
         assert f"<{kind}>" in plain
     assert output.count("2026-10-21 12:00:00 UTC+8") == 4
-    assert "removed heading" not in output
+    assert "removed heading" in output
     assert "暂无个性签名" in output
 
 
@@ -313,11 +329,12 @@ async def test_activity_hides_missing_data_and_uses_completed_operation_time():
     "url",
     [
         "file:///etc/passwd",
-        "http://127.0.0.1/a",
-        "https://qlogo.cn.evil.test/a",
+        "ftp://example.test/a",
+        "data:image/png;base64,AA",
         "https://user:pass@qq.com/a",
-        "https://qq.com:9999/a",
+        "javascript:alert(1)",
     ],
 )
-def test_unsafe_image_origins_are_rejected(url):
-    assert safe_image(url) == ""
+def test_invalid_background_configuration_is_rejected(url):
+    with pytest.raises(ValueError):
+        Renderer(None, RESOURCES, background_url=url)

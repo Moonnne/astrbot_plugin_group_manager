@@ -1,7 +1,7 @@
 name: astrbot_plugin_group_manager
 display_name: Monitor
 desc: Monitor | QQ 群管理，支持入群审批、算术验证、成员历史、群内黑白名单及公共黑名单。
-version: v0.1.0
+version: v0.2.0
 author: Moonne
 repo: https://github.com/Moonnne/astrbot_plugin_group_manager
 astrbot_version: '>=4.29.1,<5'

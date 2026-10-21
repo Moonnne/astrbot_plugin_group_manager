@@ -1,117 +1,159 @@
-"""Approval state transitions and per-operator review snapshots."""
+"""Expiring join requests and a single review snapshot per group."""
 
 import uuid
+from dataclasses import asdict
 
-from ..models.domain import decision
+from ..models.join_request import JoinRequest
+from ..models.review_snapshot import ReviewSnapshot
+from ..utils.scope import scope_key
+from .rules import decision
 
 
 class Approval:
-    def __init__(self, repository, gateway, clock, logger):
-        self.db, self.api, self.clock, self.log = repository, gateway, clock, logger
+    MAX_REQUESTS = 2048
+    MAX_PER_GROUP = 128
+
+    def __init__(self, controller):
+        self.c = controller
+        self.requests = {}
+        self.snapshots = {}
+
+    def prune(self):
+        now = self.c.clock()
+        self.requests = {
+            key: row for key, row in self.requests.items() if row.expires_at > now
+        }
+        self.snapshots = {
+            key: row
+            for key, row in self.snapshots.items()
+            if row.expires_at > now
+            and any(value in self.requests for value in row.items.values())
+        }
+
+    def clear_group(self, scope):
+        self.requests = {
+            key: row for key, row in self.requests.items() if row.scope != scope
+        }
+        self.snapshots.pop(scope_key(scope), None)
+
+    def latest(self, scope, qq):
+        return next(
+            (
+                r
+                for r in reversed(list(self.requests.values()))
+                if r.scope == scope and r.qq == qq
+            ),
+            None,
+        )
 
     async def receive(self, scope, raw):
-        """Persist an identifiable human request and apply the arrival-time policy.
-
-        Args:
-            scope: Original bot and group identity.
-            raw: OneBot group request with its opaque flag.
-
-        Returns:
-            The request ID and group revision, or None for ignored/duplicate events.
-        """
-        settings = await self.db.one("settings", {"scope": scope.key})
+        settings = await self.c.settings.get(scope)
         if not settings["enabled"]:
             return None
         subtype = raw.get("sub_type")
+        inviter = ""
         if subtype == "add":
-            qq, inviter = str(raw.get("user_id", "")), ""
+            qq = str(raw.get("user_id", ""))
         elif subtype == "invite":
-            qq, inviter = str(raw.get("invited_id", "")), str(raw.get("user_id", ""))
+            # Standard invitations target the bot; only explicit invited_id can identify another applicant.
+            qq = str(raw.get("invited_id") or "")
+            inviter = str(raw.get("user_id") or "")
         else:
             return None
         flag = raw.get("flag")
-        if not qq.isdigit() or qq == scope.bot or not isinstance(flag, str) or not flag:
+        if (
+            not qq.isdigit()
+            or qq == scope.bot
+            or not isinstance(flag, str)
+            or not flag
+            or len(flag) > 4096
+        ):
             return None
-        now = self.clock()
-        p = {
-            "scope": scope.key,
-            "qq": qq,
-            "inviter": inviter,
-            "flag": flag,
-            "subtype": subtype,
-            "reason": str(raw.get("comment") or "")[:2000],
-            "happened": float(raw.get("time") or now),
-            "now": now,
-            "expires": now + 1800,
-        }
-        if not await self.db.execute("add_request", p):
+        self.prune()
+        if any(r.scope == scope and r.flag == flag for r in self.requests.values()):
             return None
-        row = await self.db.one("request_by_flag", p)
-        action = decision(settings, await self.db.flags(scope, qq))
+        if (
+            len(self.requests) >= self.MAX_REQUESTS
+            or sum(r.scope == scope for r in self.requests.values())
+            >= self.MAX_PER_GROUP
+        ):
+            self.c.log.warning("Request cache full: scope=%s", scope_key(scope))
+            return None
+        now = self.c.clock()
+        row = JoinRequest(
+            uuid.uuid4().hex,
+            scope,
+            qq,
+            flag,
+            subtype,
+            str(raw.get("comment") or "")[:2000],
+            now,
+            now + 1800,
+            inviter,
+        )
+        self.requests[row.id] = row
+        action = decision(settings, await self.c.db.flags(scope, qq))
         if action in {"approve", "reject"}:
-            await self.act(scope, row["id"], scope.bot, action == "approve")
-        return row["id"], settings["revision"]
+            await self.act(scope, row, scope.bot, action == "approve")
+        return row
 
-    async def act(self, scope, request_id, actor, approve):
-        p = {"scope": scope.key, "id": request_id, "actor": actor, "now": self.clock()}
-        if not await self.db.execute("claim_request", p):
-            return False
-        row = await self.db.one("request", p)
-        status = "approved" if approve else "rejected"
-        audit = {
-            **p,
-            "key": f"request:{request_id}",
-            "qq": row["qq"],
-            "action": status,
-            "result": "dispatched",
-        }
-        await self.db.execute("audit", audit)
+    async def act(self, scope, row, actor, approve):
+        if (
+            self.requests.get(row.id) is not row
+            or row.scope != scope
+            or row.status != "pending"
+            or row.expires_at <= self.c.clock()
+        ):
+            return None
+        if (
+            not await self.c.allows_scope(scope)
+            or not (await self.c.settings.get(scope))["enabled"]
+        ):
+            return None
+        row.status = "processing"
+        row.actor = actor
         try:
-            await self.api.approve(scope, row, approve)
+            await self.c.api.approve(scope, asdict(row), approve)
+            row.status = "approved" if approve else "rejected"
         except Exception as exc:
-            status = "unknown"
-            self.log.warning(
+            row.status = "unknown"
+            self.c.log.warning(
                 "Approval outcome uncertain: scope=%s request=%s error=%s",
-                scope.key,
-                request_id,
+                scope_key(scope),
+                row.id,
                 type(exc).__name__,
             )
-        await self.db.batch(
-            [
-                ("finish_request", {**p, "status": status, "now": self.clock()}),
-                ("audit", {**audit, "result": status, "now": self.clock()}),
-            ]
-        )
-        return status
+        row.decided_at = self.c.clock() if row.status != "unknown" else None
+        return row.status
 
-    async def select(self, scope, actor, target):
-        p = {"scope": scope.key, "actor": actor, "now": self.clock()}
+    def select(self, scope, target):
+        self.prune()
         if target:
-            p["number"] = 0 if target == "all" else int(target)
-            rows = await self.db.all("snapshot_items", p)
-            return rows, None
-        snapshot = uuid.uuid4().hex
-        await self.db.batch(
-            [
-                ("invalidate_snapshots", p),
-                ("create_snapshot", {**p, "id": snapshot, "expires": p["now"] + 1800}),
+            snapshot = self.snapshots.get(scope_key(scope))
+            if not snapshot or not snapshot.active:
+                return [], None
+            ids = (
+                snapshot.items.values()
+                if target == "all"
+                else [snapshot.items.get(int(target))]
+            )
+            rows = [
+                self.requests[key]
+                for key in ids
+                if key in self.requests and self.requests[key].status == "pending"
             ]
+            return rows, None
+        self.snapshots.pop(scope_key(scope), None)
+        rows = sorted(
+            (
+                r
+                for r in self.requests.values()
+                if r.scope == scope and r.status == "pending"
+            ),
+            key=lambda r: r.received_at,
         )
-        rows = await self.db.all("pending", p)
         if len(rows) <= 1:
             return rows, None
-        jobs = []
-        for number, row in enumerate(rows, 1):
-            row["number"] = number
-            jobs.append(
-                (
-                    "add_snapshot_item",
-                    {
-                        "snapshot": snapshot,
-                        "number": number,
-                        "request": row["id"],
-                    },
-                )
-            )
-        await self.db.batch(jobs)
+        snapshot = ReviewSnapshot(uuid.uuid4().hex, self.c.clock() + 1800)
+        self.snapshots[scope_key(scope)] = snapshot
         return rows, snapshot

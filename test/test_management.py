@@ -1,10 +1,14 @@
-"""Behavioral tests for moderation, isolation, persistence, and races."""
+"""Moderation rules, group snapshots, expiry, and resource ownership."""
 
 import asyncio
+import json
 from unittest.mock import AsyncMock
 
 import pytest
-from monitor_plugin.models.domain import Scope, parse_command
+from monitor_plugin.core.rules import parse_command
+from monitor_plugin.core.settings import Settings
+from monitor_plugin.models.scope import Scope
+from monitor_plugin.utils.scope import group_umo, scope_key
 
 pytestmark = pytest.mark.asyncio
 
@@ -14,624 +18,403 @@ async def command(e, text, actor="10001", superuser=False, scope=None):
 
 
 async def enable(e):
-    await e.db.execute(
-        "set_enabled",
+    await e.settings.update(e.scope, "10001", e.clock(), enabled=True)
+
+
+async def request(e, qq="20001", flag=None):
+    return await e.c.approval.receive(
+        e.scope,
         {
-            "scope": e.scope.key,
-            "actor": "10001",
-            "now": e.clock(),
-            "value": 1,
+            "post_type": "request",
+            "request_type": "group",
+            "sub_type": "add",
+            "user_id": qq,
+            "flag": flag or f"flag-{qq}",
+            "comment": "hello",
+            "time": e.clock(),
         },
     )
 
 
-async def request(e, qq="20001", flag=None, **extra):
-    raw = {
-        "post_type": "request",
-        "request_type": "group",
-        "sub_type": "add",
-        "user_id": int(qq),
-        "flag": flag or f"flag-{qq}",
-        "comment": "hello",
-        "time": e.clock(),
-        **extra,
-    }
-    async with e.c.locks[e.scope.key]:
-        return await e.c.approval.receive(e.scope, raw)
-
-
-async def join(e, qq="20001", subtype="approve"):
-    e.api.members[qq] = e.clock()
-    async with e.c.locks[e.scope.key]:
-        await e.c.verification.notice(
-            e.scope,
-            {
-                "notice_type": "group_increase",
-                "sub_type": subtype,
-                "user_id": qq,
-                "time": e.clock(),
-                "operator_id": "10001",
-            },
-        )
-
-
-async def challenge(e, qq="20001"):
-    return await e.db.one("challenge", {"scope": e.scope.key, "qq": qq})
+async def notice(e, qq="20001", kind="group_increase", subtype="approve"):
+    if kind == "group_increase":
+        e.api.members[qq] = e.clock()
+    await e.c.handle(
+        e.scope,
+        group_umo(e.scope),
+        {
+            "post_type": "notice",
+            "notice_type": kind,
+            "sub_type": subtype,
+            "user_id": qq,
+            "time": e.clock(),
+            "operator_id": "10001",
+        },
+        "",
+    )
+    await asyncio.gather(*list(e.c.background))
 
 
 @pytest.mark.parametrize("text", ["/g", "/g help"])
-async def test_help_is_available_to_members_while_disabled(env, text):
-    e = env
-    e.api.fail_role = True
-    await command(e, text, actor="20001")
-    assert e.api.sent == [(e.scope.key, "", "https://example.test/help.png", None)]
-    settings = await e.db.one("settings", {"scope": e.scope.key})
-    assert not settings["enabled"]
-    assert not e.api.approvals and not e.api.kicks
-
-
-async def test_live_join_after_snapshot_still_creates_challenge(env):
-    e = env
-    await enable(e)
-    e.api.members["20001"] = e.clock()
-    await e.c.sync_members(e.scope)
-    await join(e)
-    assert await challenge(e)
-
-
-async def test_defaults_permissions_and_local_isolation(env):
-    e = env
-    settings = await e.db.one("settings", {"scope": e.scope.key})
-    assert (
-        not settings["enabled"]
-        and not settings["auto_approve"]
-        and not settings["skip_ban"]
-    )
-    await command(e, "/g on", actor="20001")
-    assert not e.api.sent
-    await command(e, "/g ban 20001 reason", actor="10002")
-    assert not (await e.db.flags(e.scope, "20001"))["black"]
-    await command(e, "/g ban 20001 reason")
-    assert (await e.db.flags(e.scope, "20001"))["black"]
-    assert not (await e.db.flags(Scope("onebot", "99999", "54321"), "20001"))["black"]
-    assert await e.db.one("member", {"scope": e.scope.key, "qq": "20001"}) is None
-
-
-async def test_whitelist_overrides_both_blacklists_and_skip(env):
-    e = env
-    await enable(e)
-    for text in (
-        "/g ban 20001 local",
-        "/g pb 20001 shared",
-        "/g wl 20001 trusted",
-        "/g auto skip_ban",
-    ):
-        await command(e, text)
-    await request(e)
-    assert e.api.approvals[-1][2] is True
-    await join(e)
-    assert await challenge(e) is None
-
-
-async def test_blacklist_manual_auto_and_independent_skip(env):
-    e = env
-    await enable(e)
-    await command(e, "/g ban 20001 reason")
-    await command(e, "/g auto")
-    await request(e)
-    assert not e.api.approvals
-    await command(e, "/g y")
-    assert e.api.approvals[-1][2] is True
-    await command(e, "/g auto")
-    await command(e, "/g auto skip_ban")
-    await request(e, flag="new-request")
-    assert e.api.approvals[-1][2] is False
-
-
-async def test_individual_snapshots_stable_numbers_and_all_excludes_new(env):
-    e = env
-    await enable(e)
-    await request(e, "20001")
-    e.clock.now += 1
-    await request(e, "20002")
-    await command(e, "/g y")
-    image_messages = [sent for sent in e.api.sent if sent[2]]
-    assert [sent[1] for sent in image_messages] == [
-        "审批列表 · 操作人 10001 · #1",
-        "审批列表 · 操作人 10001 · #2",
+async def test_help_is_image_even_when_disabled(env, text):
+    env.api.fail_role = True
+    await command(env, text, actor="20001")
+    assert env.api.sent == [
+        (scope_key(env.scope), "", "https://example.test/help.png", None)
     ]
-    await command(e, "/g n", actor="10002")
-    await command(e, "/g y 1")
-    e.clock.now += 1
-    await request(e, "20003")
-    await command(e, "/g n all", actor="10002")
-    assert [(x[1], x[2]) for x in e.api.approvals] == [
-        ("20001", True),
-        ("20002", False),
-    ]
-    await command(e, "/g y 2")
-    assert len(e.api.approvals) == 2
-    await command(e, "/g y")
-    assert e.api.approvals[-1][1] == "20003"
 
 
-async def test_expiry_snapshot_does_not_extend_request(env):
-    e = env
-    await enable(e)
-    await request(e, "20001")
-    e.clock.now += 1700
-    await request(e, "20002")
-    await command(e, "/g y")
-    e.clock.now += 101
-    await command(e, "/g y 1")
-    assert not e.api.approvals
-    await command(e, "/g y 2")
-    assert e.api.approvals[-1][1] == "20002"
+async def test_database_has_only_three_durable_tables(env):
+    async with env.db.db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ) as cursor:
+        names = {row[0] for row in await cursor.fetchall()}
+    assert names == {"group_members", "group_list_entries", "public_blacklist_entries"}
 
 
-async def test_parallel_decision_once_and_unknown_not_retried(env):
-    e = env
-    await enable(e)
-    await request(e)
-    e.api.fail_approval = True
-    await asyncio.gather(command(e, "/g y"), command(e, "/g n", "10002"))
-    assert len(e.api.approvals) == 1
-    row = await e.db.one(
-        "request_by_flag", {"scope": e.scope.key, "flag": "flag-20001"}
-    )
-    assert row["status"] == "unknown"
-
-
-async def test_public_multiple_owners_revoke_and_superuser(env):
-    e = env
-    e.api.roles["10003"] = "owner"
-    await command(e, "/g pb 20001 first")
-    await command(e, "/g pb 20001 second", "10003")
-    e.api.roles["10001"] = "member"
-    await command(e, "/g rmpb 20001", "10001")
-    flags = await e.db.flags(e.scope, "20001")
-    assert (
-        len(flags["public_entries"]) == 1
-        and flags["public_entries"][0]["actor"] == "10003"
-    )
-    await command(e, "/g rmpb 20001", "20002")
-    assert (await e.db.flags(e.scope, "20001"))["public"]
-    await command(e, "/g rmpb 20001", "10000", True)
-    assert not (await e.db.flags(e.scope, "20001"))["public"]
-
-
-async def test_off_cancels_existing_but_tracks_members(env):
-    e = env
-    await enable(e)
-    await request(e)
-    await join(e, "20002")
-    row = await challenge(e, "20002")
-    await e.c.verification.deliver(row)
-    await command(e, "/g off", "10002")
-    assert await challenge(e, "20002") is None
-    await join(e, "20003")
-    assert await challenge(e, "20003") is None
-    assert (await e.db.one("member", {"scope": e.scope.key, "qq": "20003"}))[
-        "presence"
-    ] == "present"
-    await command(e, "/g on")
-    await command(e, "/g y")
-    assert not e.api.approvals and not e.api.kicks
-
-
-async def test_answer_is_scoped_correct_and_cancels_timeout(env):
-    e = env
-    await enable(e)
-    await join(e)
-    row = await challenge(e)
-    await e.c.verification.deliver(row)
-    await command(e, f"/ans {row['answer']}", actor="20002")
-    assert (await challenge(e))["state"] == "waiting"
-    await command(e, "/ans 999999", actor="20001")
-    assert (await challenge(e))["attempts"] == 1
-    await command(e, f"/ans {row['answer']}", actor="20001")
-    assert await challenge(e) is None
-    e.clock.now += 601
-    await e.c.verification.expire(row)
-    assert not e.api.kicks
-
-
-async def test_render_failure_never_arms_kick(env):
-    e = env
-    await enable(e)
-    await join(e)
-    row = await challenge(e)
-    e.renderer.fail_formula = True
-    await e.c.verification.deliver(row)
-    stored = await challenge(e)
-    assert stored["deadline"] is None and stored["state"] == "delivery"
-    e.clock.now += 900
-    await e.c.verification.expire(row)
-    assert not e.api.kicks
-
-
-async def test_timeout_kick_once_without_permanent_ban(env):
-    e = env
-    await enable(e)
-    await join(e)
-    row = await challenge(e)
-    await e.c.verification.deliver(row)
-    e.clock.now += 601
-    await asyncio.gather(e.c.verification.expire(row), e.c.verification.expire(row))
-    assert e.api.kicks == [(e.scope.key, "20001")]
-    assert (await e.db.one("member", {"scope": e.scope.key, "qq": "20001"}))[
-        "presence"
-    ] == "present"
-
-
-async def test_leave_rejoin_old_deadline_cannot_kick_new_membership(env):
-    e = env
-    await enable(e)
-    await join(e)
-    old = await challenge(e)
-    await e.c.verification.deliver(old)
-    e.clock.now += 5
-    await e.c.verification.notice(
-        e.scope,
-        {
-            "notice_type": "group_decrease",
-            "sub_type": "leave",
-            "user_id": "20001",
-            "time": e.clock(),
-        },
-    )
-    e.clock.now += 5
-    await join(e)
-    new = await challenge(e)
-    assert old["session_id"] != new["session_id"]
-    e.clock.now += 601
-    await e.c.verification.expire(old)
-    assert not e.api.kicks
-    member = await e.db.one("member", {"scope": e.scope.key, "qq": "20001"})
-    assert member["leave_count"] == 1 and member["first_join"] < member["last_join"]
-
-
-async def test_whitelist_during_verification_and_admin_promotion(env):
-    e = env
-    await enable(e)
-    await join(e)
-    row = await challenge(e)
-    await e.c.verification.deliver(row)
-    await command(e, "/g wl 20001 trusted")
-    e.clock.now += 601
-    await e.c.verification.expire(row)
-    assert not e.api.kicks
-    await join(e, "20002")
-    row2 = await challenge(e, "20002")
-    await e.c.verification.deliver(row2)
-    e.api.roles["20002"] = "admin"
-    e.clock.now += 601
-    await e.c.verification.expire(row2)
-    assert not e.api.kicks
-
-
-async def test_duplicate_request_and_notice_no_double_counts(env):
-    e = env
-    await enable(e)
-    first = await request(e)
-    e.clock.now += 100
-    assert await request(e) is None
-    assert (await e.db.one("request", {"scope": e.scope.key, "id": first[0]}))[
-        "expires_at"
-    ] == e.clock() + 1700
-    await join(e)
-    await join(e)
-    assert (
-        len(await e.db.all("history_local", {"scope": e.scope.key, "qq": "20001"})) == 1
-    )
-
-
-async def test_invite_identifies_target_and_excludes_robot(env):
-    e = env
-    await enable(e)
-    assert await request(e, sub_type="invite") is None
-    assert await request(e, sub_type="invite", invited_id=99999) is None
-    result = await request(e, sub_type="invite", invited_id=20002)
-    row = await e.db.one("request", {"scope": e.scope.key, "id": result[0]})
-    assert row["qq"] == "20002" and row["inviter"] == "20001"
-
-
-async def test_restart_recovers_expired_challenge_without_immediate_kick(env):
-    e = env
-    await enable(e)
-    await join(e)
-    old = await challenge(e)
-    await e.c.verification.deliver(old)
-    e.clock.now += 601
-    await e.db.execute("recover_challenges", {"now": e.clock()})
-    recovered = await challenge(e)
-    assert recovered["state"] == "delivery" and recovered["deadline"] is None
-    await e.c.verification.deliver(recovered)
-    assert (await challenge(e))["deadline"] == e.clock() + 600
-    assert not e.api.kicks
-
-
-async def test_history_cross_group_requires_current_public_flag(env):
-    e = env
-    await join(e)
-    other = Scope("onebot", "99999", "54321")
-    await e.db.execute(
-        "ensure_group",
-        {"scope": other.key, "umo": "other", "actor": "10001", "now": e.clock()},
-    )
-    e.clock.now += 5
-    await e.c.verification.notice(
-        other,
-        {
-            "notice_type": "group_increase",
-            "sub_type": "approve",
-            "user_id": "20001",
-            "time": e.clock(),
-        },
-    )
-    await command(e, "/g info 20001")
-    assert all(row["scope"] == e.scope.key for row in e.renderer.cards[-1][2])
-    await command(e, "/g pb 20001 shared")
-    await command(e, "/g info 20001")
-    assert {row["scope"] for row in e.renderer.cards[-1][2]} == {other.key, e.scope.key}
-    await command(e, "/g rmpb 20001")
-    await command(e, "/g info 20001")
-    assert all(row["scope"] == e.scope.key for row in e.renderer.cards[-1][2])
-
-
-async def test_transaction_failure_rolls_back_all_changes(env):
-    e = env
+async def test_database_rolls_back_partial_write_and_remains_usable(env):
     with pytest.raises(KeyError):
-        await e.db.batch(
+        await env.db.batch(
             [
                 (
-                    "set_enabled",
+                    "add_local",
                     {
-                        "scope": e.scope.key,
-                        "value": 1,
+                        "scope": scope_key(env.scope),
+                        "qq": "20001",
+                        "kind": "black",
+                        "note": "rollback",
                         "actor": "10001",
-                        "now": e.clock(),
+                        "now": env.clock(),
                     },
                 ),
                 ("missing_query", {}),
             ]
         )
-    assert not (await e.db.one("settings", {"scope": e.scope.key}))["enabled"]
+    assert not (await env.db.flags(env.scope, "20001"))["black"]
+    await command(env, "/g ban 20001 valid")
+    assert (await env.db.flags(env.scope, "20001"))["black"]
 
 
-async def test_rendering_off_does_not_emit_stale_card(env):
-    e = env
-    await enable(e)
-    result = await request(e)
-    started, release = asyncio.Event(), asyncio.Event()
-    original = e.renderer.card
-
-    async def slow(*args):
-        started.set()
-        await release.wait()
-        return await original(*args)
-
-    e.renderer.card = slow
-    task = asyncio.create_task(e.c.show_request(e.scope, *result))
-    await started.wait()
-    await command(e, "/g off")
-    release.set()
-    assert await task is False
-    assert all(sent[2] is None for sent in e.api.sent)
+async def test_umo_json_settings_and_bot_isolation(env):
+    await command(env, "/g on")
+    path = env.settings.path(env.scope)
+    assert path.parent.name == "settings"
+    assert path.name == "onebot%3AGroupMessage%3A12345.json"
+    assert json.loads(path.read_text(encoding="utf-8"))["bots"]["99999"]["enabled"]
+    reloaded = Settings(path.parent)
+    assert (await reloaded.get(env.scope))["enabled"]
+    other_bot = Scope("onebot", "88888", "12345")
+    assert not (await reloaded.get(other_bot))["enabled"]
 
 
-async def test_rendering_snapshot_cannot_reactivate_after_empty_refresh(env):
-    e = env
-    await enable(e)
-    await request(e)
-    await request(e, "20002")
-    started, release = asyncio.Event(), asyncio.Event()
-    original = e.renderer.card
+async def test_permissions_scope_and_admin_override(env):
+    await command(env, "/g on", actor="20001")
+    assert not (await env.settings.get(env.scope))["enabled"]
+    await command(env, "/g on", actor="10002")
+    await command(env, "/g ban 20001 ad", actor="10002")
+    assert not (await env.db.flags(env.scope, "20001"))["black"]
+    await command(env, "/g ban 20001 ad", actor="10000", superuser=True)
+    assert (await env.db.flags(env.scope, "20001"))["black"]
+    other = Scope("onebot", "99999", "54321")
+    assert not (await env.db.flags(other, "20001"))["black"]
+    await command(env, "/g on", actor="10000", superuser=True, scope=other)
+    assert not (await env.settings.get(other))["enabled"]
 
-    async def slow(*args):
-        started.set()
-        await release.wait()
-        return await original(*args)
 
-    e.renderer.card = slow
-    task = asyncio.create_task(command(e, "/g y"))
-    await started.wait()
-    e.clock.now += 1801
-    await command(e, "/g y")
-    release.set()
-    await task
-    assert not e.api.sent
-    assert not await e.db.all(
-        "snapshot_items",
+async def test_whitelist_wins_over_both_blacklists_and_skip(env):
+    await enable(env)
+    for text in (
+        "/g auto skip_ban",
+        "/g ban 20001 ad",
+        "/g pb 20001 ad",
+        "/g wl 20001 trusted",
+    ):
+        await command(env, text)
+    row = await request(env)
+    assert row.status == "approved"
+    assert env.api.approvals[-1][2] is True
+    await notice(env)
+    assert not env.c.verification.challenges
+    assert (await env.db.member(env.scope, "20001"))["verification"] == "exempt"
+
+
+async def test_auto_blacklist_downgrades_to_manual_and_skip_is_independent(env):
+    await enable(env)
+    await command(env, "/g auto")
+    await command(env, "/g ban 20001 ad")
+    assert (await request(env)).status == "pending"
+    assert not env.api.approvals
+    await command(env, "/g auto")
+    await command(env, "/g auto skip_ban")
+    row = await request(env, "20002")
+    assert row.status == "pending"
+    await command(env, "/g pb 20003 ad")
+    assert (await request(env, "20003")).status == "rejected"
+
+
+async def test_public_list_multiple_adders_and_original_adder_revocation(env):
+    await command(env, "/g pb 20001 first")
+    await command(env, "/g pb 20001 second", actor="10000", superuser=True)
+    env.api.roles["10001"] = "member"
+    await command(env, "/g rmpb 20001")
+    flags = await env.db.flags(env.scope, "20001")
+    assert flags["public"] and [row["actor"] for row in flags["public_entries"]] == [
+        "10000"
+    ]
+    await command(env, "/g rmpb 20001", actor="10002")
+    assert (await env.db.flags(env.scope, "20001"))["public"]
+    await command(env, "/g rmpb 20001", actor="10000", superuser=True)
+    assert not (await env.db.flags(env.scope, "20001"))["public"]
+
+
+async def test_group_shared_snapshot_all_does_not_include_new_requests(env):
+    await enable(env)
+    first, second = await request(env), await request(env, "20002")
+    await command(env, "/g y", actor="10001")
+    snapshot = env.c.approval.snapshots[scope_key(env.scope)]
+    assert snapshot.active and list(snapshot.items.values()) == [first.id, second.id]
+    third = await request(env, "20003")
+    await command(env, "/g y 1", actor="10002")
+    assert first.status == "approved"
+    await command(env, "/g n all", actor="10002")
+    assert second.status == "rejected" and third.status == "pending"
+    assert env.c.approval.snapshots[scope_key(env.scope)] is snapshot
+
+
+async def test_group_snapshot_refresh_and_expiry_do_not_extend_request(env):
+    await enable(env)
+    first = await request(env)
+    await request(env, "20002")
+    await command(env, "/g y")
+    old = env.c.approval.snapshots[scope_key(env.scope)]
+    env.clock.now += 100
+    await request(env, "20003")
+    await command(env, "/g n", actor="10002")
+    new = env.c.approval.snapshots[scope_key(env.scope)]
+    assert new.id != old.id and len(new.items) == 3
+    env.clock.now += 1701
+    await command(env, "/g y 1")
+    assert first.status == "pending" and not env.api.approvals
+
+
+async def test_unknown_approval_is_never_retried(env):
+    await enable(env)
+    row = await request(env)
+    env.api.fail_approval = True
+    await command(env, "/g y")
+    await command(env, "/g y")
+    assert row.status == "unknown" and len(env.api.approvals) == 1
+
+
+@pytest.mark.parametrize("subtype", ["approve", "invite"])
+async def test_actual_join_sends_formula_and_answer_passes(env, subtype):
+    await enable(env)
+    await notice(env, subtype=subtype)
+    row = env.c.verification.challenges[(scope_key(env.scope), "20001")]
+    assert row.state == "waiting" and row.deadline == env.clock() + 600
+    assert env.api.sent[-1][2] == "https://example.test/formula.png"
+    await command(env, "/ans 999999", actor="20001")
+    assert row.deadline == env.clock() + 600
+    await command(env, f"/ans {row.answer}", actor="20001")
+    assert not env.c.verification.challenges
+    assert (await env.db.member(env.scope, "20001"))["verification"] == "passed"
+    before = list(env.api.sent)
+    await command(env, "/ans 1", actor="20002")
+    assert env.api.sent == before
+
+
+async def test_failed_formula_does_not_arm_kick_and_has_bounded_retries(env):
+    await enable(env)
+    env.renderer.fail_formula = True
+    await notice(env)
+    row = env.c.verification.challenges[(scope_key(env.scope), "20001")]
+    assert row.state == "delivery" and row.deadline == 0
+    for _ in range(2):
+        env.clock.now += 31
+        await env.c.verification.deliver(row)
+    assert not env.c.verification.challenges and not env.api.kicks
+
+
+async def test_timeout_rechecks_membership_and_removes_once(env):
+    await enable(env)
+    await notice(env)
+    row = env.c.verification.challenges[(scope_key(env.scope), "20001")]
+    env.clock.now += 601
+    await asyncio.gather(env.c.verification.expire(row), env.c.verification.expire(row))
+    assert env.api.kicks == [(scope_key(env.scope), "20001")]
+    assert not env.c.verification.challenges
+
+
+async def test_timeout_does_not_kick_rejoin_or_admin(env):
+    await enable(env)
+    await notice(env)
+    old = env.c.verification.challenges[(scope_key(env.scope), "20001")]
+    env.clock.now += 601
+    env.api.members["20001"] = env.clock()
+    await env.c.verification.expire(old)
+    assert not env.api.kicks
+    env.clock.now += 1
+    await notice(env, "20002")
+    row = env.c.verification.challenges[(scope_key(env.scope), "20002")]
+    env.clock.now += 601
+    env.api.roles["20002"] = "admin"
+    await env.c.verification.expire(row)
+    assert not env.api.kicks
+
+
+async def test_off_cancels_transients_but_still_records_membership(env):
+    await enable(env)
+    await request(env)
+    await request(env, "20002")
+    await command(env, "/g y")
+    await notice(env)
+    await command(env, "/g off")
+    assert (
+        not env.c.approval.requests
+        and not env.c.approval.snapshots
+        and not env.c.verification.challenges
+    )
+    env.clock.now += 1
+    await notice(env, kind="group_decrease", subtype="leave")
+    member = await env.db.member(env.scope, "20001")
+    assert member["leave_count"] == 1 and member["presence"] == "absent"
+    await notice(env, kind="group_decrease", subtype="leave")
+    assert (await env.db.member(env.scope, "20001"))["leave_count"] == 1
+    env.clock.now += 1
+    await notice(env)
+    member = await env.db.member(env.scope, "20001")
+    assert member["first_join"] < member["last_join"]
+    assert not env.c.verification.challenges
+
+
+async def test_info_only_exposes_cross_group_aggregate_for_public_targets(env):
+    other = Scope("other", "88888", "54321")
+    await env.db.execute(
+        "join_member",
         {
-            "scope": e.scope.key,
-            "actor": "10001",
-            "number": 0,
-            "now": e.clock(),
+            "scope": scope_key(other),
+            "qq": "20001",
+            "happened": env.clock(),
+            "session": "x",
+            "method": "申请入群",
+            "reason": "history",
+            "now": env.clock(),
         },
     )
+    await command(env, "/g info 20001")
+    assert not env.renderer.cards[-1][2]
+    await command(env, "/g pb 20001 ad")
+    await command(env, "/g info 20001")
+    assert env.renderer.cards[-1][2][0]["scope"] == scope_key(other)
+    assert all(text == "" and image for _, text, image, _ in env.api.sent[-1:])
+    env.renderer.fail_card = True
+    before = list(env.api.sent)
+    await command(env, "/g info 20001")
+    assert env.api.sent == before
 
 
-async def test_batch_stops_after_operator_loses_role(env):
-    e = env
-    await enable(e)
-    await request(e)
-    await request(e, "20002")
-    await command(e, "/g y", "10002")
-    original = e.api.approve
-
-    async def revoke_after_first(*args):
-        await original(*args)
-        e.api.roles["10002"] = "member"
-
-    e.api.approve = revoke_after_first
-    await command(e, "/g y all", "10002")
-    assert len(e.api.approvals) == 1
-
-
-async def test_unknown_role_and_missing_bot_permission_do_not_kick(env):
-    e = env
-    await enable(e)
-    await join(e)
-    row = await challenge(e)
-    await e.c.verification.deliver(row)
-    e.clock.now += 601
-    e.api.fail_role = True
-    await e.c.verification.expire(row)
-    assert not e.api.kicks
-    e.api.fail_role = False
-    e.api.roles["99999"] = "member"
-    await e.c.verification.expire(row)
-    assert not e.api.kicks
-    stored = await e.db.one("challenge_id", {"id": row["id"]})
-    assert stored["state"] == "no_permission"
-
-
-async def test_database_cancel_finishes_transaction_before_release(env):
-    e = env
-    await e.db.lock.acquire()
-    task = asyncio.create_task(
-        e.db.execute(
-            "set_enabled",
-            {
-                "scope": e.scope.key,
-                "value": 1,
-                "actor": "10001",
-                "now": e.clock(),
-            },
-        )
+async def test_runtime_caps_ttl_and_shutdown_cleanup(env):
+    await enable(env)
+    env.c.approval.MAX_PER_GROUP = 2
+    await request(env)
+    await request(env, "20002")
+    assert await request(env, "20003") is None
+    env.clock.now += 1801
+    env.c.approval.prune()
+    assert not env.c.approval.requests
+    await env.c.start()
+    env.c.enqueue(
+        env.scope,
+        {
+            "post_type": "notice",
+            "notice_type": "group_increase",
+            "user_id": "20001",
+            "time": env.clock(),
+        },
     )
-    await asyncio.sleep(0)
-    task.cancel()
-    e.db.lock.release()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert (await e.db.one("settings", {"scope": e.scope.key}))["enabled"] == 1
-    assert not e.db.db.in_transaction
+    await env.c.queue.join()
+    await env.c.stop()
+    assert not env.c.background and not env.c.workers and not env.c.seen
+    assert not env.c.verification.challenges and env.c.queue.empty()
 
 
-async def test_new_join_after_missed_leave_supersedes_old_challenge(env):
-    e = env
-    await enable(e)
-    await join(e)
-    old = await challenge(e)
-    await e.c.verification.deliver(old)
-    e.clock.now += 60
-    await join(e)
-    new = await challenge(e)
-    assert new["session_id"] != old["session_id"]
-    assert (await e.db.one("challenge_id", {"id": old["id"]}))["state"] == "superseded"
-    member = await e.db.one("member", {"scope": e.scope.key, "qq": "20001"})
-    assert member["leave_count"] == 0
-    e.clock.now += 601
-    await e.c.verification.expire(old)
-    assert not e.api.kicks
+async def test_off_while_formula_is_rendering_discards_late_image(env):
+    await enable(env)
+    started, release = asyncio.Event(), asyncio.Event()
 
+    async def render(*args):
+        started.set()
+        await release.wait()
+        return "https://example.test/late.png"
 
-@pytest.mark.parametrize("fail", [False, True])
-async def test_approval_operation_time_is_successful_completion(env, fail):
-    e = env
-    await enable(e)
-    await request(e)
-    started = e.clock()
-    original = e.api.approve
-
-    async def delayed(*args):
-        e.clock.now += 8
-        if fail:
-            raise TimeoutError()
-        return await original(*args)
-
-    e.api.approve = delayed
-    await command(e, "/g y")
-    row = await e.db.one(
-        "request_by_flag", {"scope": e.scope.key, "flag": "flag-20001"}
+    env.renderer.formula = render
+    await env.c.verification.notice(
+        env.scope,
+        {
+            "notice_type": "group_increase",
+            "sub_type": "approve",
+            "user_id": "20001",
+            "time": env.clock(),
+        },
     )
-    assert row["status"] == ("unknown" if fail else "approved")
-    assert row["decided_at"] == (None if fail else started + 8)
-    observed = []
-    original_card = e.renderer.card
-
-    async def capture_card(*args):
-        observed.append(args[5])
-        return await original_card(*args)
-
-    e.renderer.card = capture_card
-    await command(e, "/g info 20001")
-    assert observed[0]["decided_at"] == row["decided_at"]
-
-
-async def test_group_scope_blocks_commands_events_and_member_snapshots(env):
-    e = env
-    other = Scope("onebot", "99999", "54321")
-    for raw, text in (
-        ({"post_type": "message"}, "/g on"),
-        ({"post_type": "request", "request_type": "group"}, ""),
-        ({"post_type": "notice", "notice_type": "group_increase"}, ""),
-    ):
-        await e.c.handle(other, "outside", raw, "10000", text, True)
-    await command(e, "/g help", actor="10000", superuser=True, scope=other)
-    e.api.call = AsyncMock(return_value=[])
-    await e.c.sync_members(other)
-    e.api.call.assert_not_called()
-    assert not await e.db.one("settings", {"scope": other.key})
-    assert not e.api.sent and not e.api.kicks and not e.api.approvals
-
-
-@pytest.mark.parametrize("waiting", [False, True])
-async def test_excluded_group_cannot_deliver_or_expire_verification(env, waiting):
-    e = env
-    await enable(e)
-    await join(e)
-    row = await challenge(e)
-    if waiting:
-        await e.c.verification.deliver(row)
-        e.clock.now += 601
-    e.api.sent.clear()
-    e.c.enabled_groups = frozenset()
-    await (e.c.verification.expire(row) if waiting else e.c.verification.deliver(row))
-    assert not e.api.sent and not e.api.kicks
-    assert (await challenge(e))["state"] == ("waiting" if waiting else "delivery")
-
-
-async def test_reload_removes_group_tasks_and_retains_history(env):
-    e = env
-    await enable(e)
-    await request(e)
-    await request(e, "20002")
-    await command(e, "/g y")
-    await join(e, "20003")
-    row = await challenge(e, "20003")
-    await e.c.verification.deliver(row)
-    e.api.sent.clear()
-    replacement = type(e.c)(
-        e.db,
-        e.api,
-        e.renderer,
-        e.c.host_admin,
-        e.c.log,
-        e.clock,
-        enabled_groups=frozenset(),
+    await asyncio.wait_for(started.wait(), 1)
+    await command(env, "/g off")
+    release.set()
+    await asyncio.gather(*list(env.c.background))
+    assert not env.c.verification.challenges
+    assert all(
+        image != "https://example.test/late.png" for _, _, image, _ in env.api.sent
     )
-    await replacement.start()
-    try:
-        await asyncio.sleep(0)
-        settings = await e.db.one("settings", {"scope": e.scope.key})
-        assert not settings["enabled"]
-        assert not await e.db.all("pending", {"scope": e.scope.key, "now": e.clock()})
-        assert (
-            await e.db.one(
-                "request_by_flag", {"scope": e.scope.key, "flag": "flag-20001"}
-            )
-        )["status"] == "abandoned"
-        assert (await e.db.one("challenge_id", {"id": row["id"]}))[
-            "state"
-        ] == "cancelled"
-        snapshot = await e.db.one(
-            "latest_snapshot", {"scope": e.scope.key, "actor": "10001"}
-        )
-        assert not snapshot["active"]
-        assert await e.db.one("member", {"scope": e.scope.key, "qq": "20003"})
-        assert not e.api.sent and not e.api.kicks
-    finally:
-        await replacement.stop()
+    assert not env.api.kicks
+
+
+async def test_unload_interrupts_verification_and_drains_managed_tasks(env):
+    await enable(env)
+    await notice(env)
+    assert env.c.verification.challenges
+    await env.c.stop()
+    assert (await env.db.member(env.scope, "20001"))["verification"] == "interrupted"
+    assert not env.c.background and not env.c.verification.challenges
+    assert not env.api.kicks
+
+
+async def test_kick_timeout_never_dispatches_twice(env):
+    await enable(env)
+    await notice(env)
+    row = env.c.verification.challenges[(scope_key(env.scope), "20001")]
+    env.api.kick = AsyncMock(side_effect=TimeoutError)
+    env.clock.now += 601
+    await env.c.verification.expire(row)
+    await env.c.verification.expire(row)
+    env.api.kick.assert_awaited_once()
+    assert (await env.db.member(env.scope, "20001"))["verification"] == "unknown"
+
+
+async def test_empty_formula_result_does_not_arm_timeout(env):
+    await enable(env)
+    env.renderer.formula = AsyncMock(return_value=None)
+    await notice(env)
+    row = env.c.verification.challenges[(scope_key(env.scope), "20001")]
+    assert row.state == "delivery" and row.deadline == 0
+    assert not env.api.sent
+
+
+async def test_scope_guard_blocks_raw_events_and_expiry(env):
+    await enable(env)
+    await notice(env)
+    row = env.c.verification.challenges[(scope_key(env.scope), "20001")]
+    env.c.scope_guard = AsyncMock(return_value=False)
+    env.clock.now += 601
+    await env.c.verification.expire(row)
+    await notice(env, "20002")
+    assert not env.api.kicks and not await env.db.member(env.scope, "20002")
+
+
+async def test_member_snapshot_updates_known_join_without_inventing_leaves(env):
+    await notice(env)
+    env.clock.now += 100
+    env.api.members["20001"] = env.clock()
+    await env.c.sync_members(env.scope)
+    member = await env.db.member(env.scope, "20001")
+    assert member["last_join"] == env.clock() and member["leave_count"] == 0
+    assert member["session_id"] is None

@@ -2,7 +2,7 @@
 
 import asyncio
 
-from ..models.domain import GROUP_ID
+from .rules import GROUP_ID
 
 
 class GroupSelector:

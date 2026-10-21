@@ -62,6 +62,9 @@ async def preview(browser_path, output):
                 return str(target)
 
             renderer = Renderer(capture, ROOT / "resource/templates")
+            cover = "data:image/png;base64," + base64.b64encode(
+                (ROOT / "resource/background/default.png").read_bytes()
+            ).decode("ascii")
             avatar = '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect width="100" height="100" fill="#9da8b3"/><text x="50" y="70" font-size="64" text-anchor="middle" fill="white">M</text></svg>'
             profile = {
                 "nickname": "示例成员",
@@ -70,7 +73,7 @@ async def preview(browser_path, output):
                 "sex": "男",
                 "age": "21",
                 "signature": "保持好奇，认真生活。",
-                "cover": renderer.help_background,
+                "cover": cover,
                 "avatar": "data:image/svg+xml;base64,"
                 + base64.b64encode(avatar.encode()).decode(),
             }
@@ -97,7 +100,7 @@ async def preview(browser_path, output):
                     None,
                     [],
                     request,
-                    "审批列表 · 操作人 10001 · #1",
+                    "审批列表 · #1",
                     now,
                     "preview",
                 )

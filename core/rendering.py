@@ -3,10 +3,14 @@
 import asyncio
 import base64
 import html
+import json
 import re
+import time
 from pathlib import Path
+from urllib.parse import urlparse
 
-from ..models.domain import Scope, display_time, light_theme
+from ..utils.scope import parse_scope
+from .rules import display_time, light_theme
 
 STATUS = {
     "pending": "待审批",
@@ -26,7 +30,7 @@ HELP_COMMANDS = (
     (
         "/g y [编号/all] · /g n [编号/all]",
         "管理员",
-        "处理最新消歧列表，all 仅包含已展示申请，使用 /g y 或 /g n 刷新列表",
+        "全群共用编号；all 仅包含已展示申请，使用 /g y 或 /g n 刷新列表",
     ),
     ("/g auto", "管理员", "切换到普通申请自动批准，默认关闭"),
     ("/g auto skip_ban", "群主", "切换黑名单自动拒绝，非自动模式可用"),
@@ -42,15 +46,32 @@ HELP_COMMANDS = (
 
 
 class Renderer:
-    def __init__(self, render, resource: Path, timeout=25):
+    def __init__(
+        self, render, resource: Path, timeout=25, *, background_url="", logger=None
+    ):
         self.render = render
+        self.log = logger
         self.timeout = timeout
         self.card_template = (resource / "card.html").read_text(encoding="utf-8")
         self.formula_template = (resource / "formula.html").read_text(encoding="utf-8")
         self.help_template = (resource / "help.html").read_text(encoding="utf-8")
-        self.help_background = "data:image/png;base64," + base64.b64encode(
-            (resource.parent / "background/default.png").read_bytes()
-        ).decode("ascii")
+        if background_url:
+            parsed = urlparse(background_url)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+            ):
+                raise ValueError("Invalid help background URL")
+        # Remote URLs are preferred; the bundled fallback is a 25 KB WebP.
+        self.help_background = (
+            background_url
+            or "data:image/webp;base64,"
+            + base64.b64encode(
+                (resource.parent / "background/default.webp").read_bytes()
+            ).decode("ascii")
+        )
         self.limit = asyncio.Semaphore(2)
 
     async def help(self, now, umo):
@@ -120,6 +141,9 @@ class Renderer:
                 activity["operation_time"] = display_time(request["decided_at"])
                 activity["actor"] = str(request.get("actor") or "")
         if member:
+            if not request:
+                activity["method"] = member.get("method") or ""
+                activity["reason"] = member.get("reason") or ""
             activity["stats"] = [
                 (label, display_time(member[key]))
                 for label, key in (
@@ -131,7 +155,7 @@ class Renderer:
             ]
             if member.get("leave_count"):
                 activity["stats"].append(("退群次数", str(member["leave_count"])))
-        if not (request or activity["stats"]):
+        if not (request or activity["stats"] or activity["method"]):
             activity = None
         list_cards = []
         for rows, public in (
@@ -157,22 +181,24 @@ class Renderer:
         history_notes = []
         history_cards = []
         for row in history:
-            scope = Scope.parse(row["scope"])
+            scope = parse_scope(row["scope"])
             history_cards.append(
                 {
                     "group": scope.group,
                     "method": row["method"],
                     "reason": row["reason"],
-                    "joined": display_time(row["joined_at"])
-                    if row["joined_at"]
+                    "joined": display_time(row["first_join"])
+                    if row["first_join"]
                     else "",
-                    "left": display_time(row["left_at"]) if row["left_at"] else "",
+                    "left": display_time(row["last_leave"])
+                    if row["last_leave"]
+                    else "",
                     "verification": row["verification"],
                 }
             )
             history_notes.append(
-                f"群 {scope.group} · {display_time(row['joined_at'])} 入群"
-                f" · {display_time(row['left_at'])} 退群 · {row['method']}"
+                f"群 {scope.group} · {display_time(row['first_join'])} 最早入群"
+                f" · {display_time(row['last_leave'])} 最近退群 · {row['method']}"
                 f" · {row['reason'] or '理由未知'} · 验证 {row['verification']}"
             )
         # Plain text is also the deterministic fallback if the renderer fails.
@@ -210,6 +236,7 @@ class Renderer:
             ]
         )
         data = {
+            "title": title,
             "profile": profile,
             "qq": qq,
             "signature": signature,
@@ -242,19 +269,34 @@ class Renderer:
         )
 
     async def _render(self, template, data, umo, width, transparent):
-        async with self.limit, asyncio.timeout(self.timeout):
-            return await self.render(
-                template,
-                data,
-                return_url=True,
-                umo=umo,
-                options={
-                    "type": "png",
-                    "full_page": True,
-                    "omit_background": transparent,
-                    "viewport_width": width,
-                    "viewport_height": 1,
-                    "animations": "disabled",
-                    "scale": "css",
-                },
-            )
+        started = time.monotonic()
+        acquired = None
+        try:
+            async with asyncio.timeout(self.timeout):
+                async with self.limit:
+                    acquired = time.monotonic()
+                    return await self.render(
+                        template,
+                        data,
+                        return_url=True,
+                        umo=umo,
+                        options={
+                            "type": "png",
+                            "full_page": True,
+                            "omit_background": transparent,
+                            "viewport_width": width,
+                            "viewport_height": 1,
+                            "animations": "disabled",
+                            "scale": "css",
+                        },
+                    )
+        finally:
+            ended = time.monotonic()
+            if self.log:
+                self.log.debug(
+                    "Template render: queue_ms=%.0f service_ms=%.0f payload_bytes=%s",
+                    ((acquired or ended) - started) * 1000,
+                    (ended - acquired) * 1000 if acquired else 0,
+                    len(template.encode("utf-8"))
+                    + len(json.dumps(data, ensure_ascii=False).encode("utf-8")),
+                )

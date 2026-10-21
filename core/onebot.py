@@ -1,16 +1,27 @@
 """OneBot access, capability fallbacks, and verified message routing."""
 
 import asyncio
-from urllib.parse import urlparse
+import time
+from collections import OrderedDict
 
 
 class OneBot:
     def __init__(self, context, timeout=15):
         self.context = context
         self.timeout = timeout
+        self.profiles = OrderedDict()
+
+    def clear(self):
+        self.profiles.clear()
+
+    def prune(self):
+        now = time.monotonic()
+        for key, (expires, _) in list(self.profiles.items()):
+            if expires <= now:
+                self.profiles.pop(key)
 
     async def call(self, scope, action, **params):
-        """Resolve and verify the original account before each protocol action.
+        """Route through CQHttp's explicit account selection.
 
         Args:
             scope: Persisted platform, bot account, and group identity.
@@ -21,19 +32,14 @@ class OneBot:
             The action data returned by aiocqhttp.
 
         Raises:
-            RuntimeError: The platform or logged-in account does not match.
+            RuntimeError: The requested OneBot platform is unavailable.
         """
         platform = self.context.get_platform_inst(scope.platform)
         if platform is None or platform.meta().name != "aiocqhttp":
             raise RuntimeError("OneBot platform is unavailable")
         client = platform.get_client()
-        # A reverse-WS reconnect can reuse the same client with another account.
         async with asyncio.timeout(self.timeout):
-            identity = await client.call_action("get_login_info")
-        if str(identity.get("user_id")) != scope.bot:
-            raise RuntimeError("OneBot identity mismatch")
-        async with asyncio.timeout(self.timeout):
-            return await client.call_action(action, **params)
+            return await client.call_action(action, self_id=int(scope.bot), **params)
 
     async def member(self, scope, qq):
         result = await self.call(
@@ -82,9 +88,14 @@ class OneBot:
         )
 
     async def profile(self, scope, qq):
+        now = time.monotonic()
+        self.prune()
+        key = (scope.platform, scope.bot, qq)
+        if key in self.profiles:
+            return dict(self.profiles[key][1])
         profile = {
             "nickname": qq,
-            "level": "Unknown",
+            "level": "未知",
             "area": "未公开",
             "avatar": f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s=640",
             "cover": "",
@@ -96,10 +107,10 @@ class OneBot:
             info = await self.call(
                 scope, "get_stranger_info", user_id=int(qq), no_cache=True
             )
-            profile["nickname"] = str(info.get("nickname") or qq)
+            profile["nickname"] = str(info.get("nickname") or qq)[:160]
             profile["signature"] = str(
                 info.get("long_nick") or info.get("longNick") or ""
-            )
+            )[:300]
             level = next(
                 (
                     info[k]
@@ -115,7 +126,7 @@ class OneBot:
                     str(info[k]) for k in ("country", "province", "city") if info.get(k)
                 )
                 or "未公开"
-            )
+            )[:160]
             profile["sex"] = {"male": "男", "female": "女"}.get(
                 info.get("sex"), "未公开"
             )
@@ -124,32 +135,9 @@ class OneBot:
                 profile["age"] = str(age)
         except Exception:
             pass
-        try:
-            dress = await self.call(scope, "_get_friend_dress", user_id=int(qq))
-            profile["avatar"] = safe_image(dress.get("avatar_url")) or profile["avatar"]
-            for item in dress.get("items", []):
-                if str(item.get("app_id")) == "15":
-                    profile["cover"] = safe_image(item.get("preview_url"))
-                    if profile["cover"]:
-                        break
-        except Exception:
-            pass
+        # Dress preview_url can contain an entire card. It is not a profile cover.
+        # Verified SnowLuma 2.0.3 exposes no dedicated cover image; use the theme fallback.
+        self.profiles[key] = (now + 120, dict(profile))
+        while len(self.profiles) > 256:
+            self.profiles.popitem(last=False)
         return profile
-
-
-def safe_image(value):
-    """Allow only known public QQ image hosts in remote render templates."""
-    if not isinstance(value, str):
-        return ""
-    try:
-        url = urlparse(value)
-        host = (url.hostname or "").lower()
-        allowed = ("qq.com", "qpic.cn", "qlogo.cn", "gtimg.cn", "gtimg.com")
-        if url.scheme in {"http", "https"} and not url.username and not url.password:
-            if url.port in {None, 80, 443} and any(
-                host == h or host.endswith("." + h) for h in allowed
-            ):
-                return value
-    except ValueError:
-        pass
-    return ""
