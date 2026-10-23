@@ -62,10 +62,8 @@ AstrBot 管理员拥有最高命令权限；其余按群主、群管理员、成
 data/plugin_data/astrbot_plugin_group_manager/
 ├── db/
 │   └── group_manager.sqlite3
-├── settings/
-│   └── onebot%3AGroupMessage%3A12345.json
-└── log/
-    └── monitor.log
+└── settings/
+    └── onebot%3AGroupMessage%3A12345.json
 ```
 
 JSON 文件名是完整群 UMO 的百分号编码，避免 Windows 不支持冒号。同一 UMO 文件按机器人账号分别保存开关，数据库按平台实例、机器人和群隔离。
@@ -75,31 +73,16 @@ SQLite 只有三张表：`group_members`、`group_list_entries`、`public_blackl
 
 本版本不包含旧数据库迁移、数据导入或自动删除旧库。备份时停止插件取得一致副本，不手动删除 WAL/SHM。
 
-## 诊断日志
+## 日志与事件
 
-插件数据目录的 `log/monitor.log` 保留最近 1000 行日志，重载时接续保留。时间为北京时间，UTF-8／CRLF。
-记录生命周期、AstrBot 群事件入口、群范围和宿主准入、命令解析与权限、队列／后台任务、设置读取与保存、数据库事务、审批状态、验证、渲染和 OneBot 调用结果。
-文件保留 DEBUG 详情，不依赖控制台日志级别；不改变宿主或其他插件的日志设置。每行最多 2000 字符，异步合并写入，卸载时等待刷新并结束写入线程。
-申请 flag 只记摘要，用于串联数据流；不记录完整申请理由、命令备注、图片数据或 token。错误详情做敏感字段脱敏。
+临时事件追踪、每步数据流日志及独立文件写入线程已移除。常规异常、过载和结果未知警告使用 AstrBot 插件 logger，遵循宿主日志级别；异常详情脱敏并截断。
+已有 log/monitor.log 属于旧诊断输出，保留原文件，当前版本不再写入。
 
-若申请无反应，重载后在目标群执行 `/g on`，再发起一条新的加群申请，随后执行 `/g y` 或 `/g n`，提供该日志用于定位。
-监听采用 AstrBot 正式群事件 Handler，从 `event.message_obj.raw_message` 读取申请和通知；参考 qqadmin 的事件接入方案。
-初始化记录 `event.handler_ready`；宿主匹配目标事件时先记录 `event.filter`，实际进入 Handler 后记录 `event.received entry=astrbot_group_handler`，随后可沿 queue、approval、verification 和 api 标签追踪。
-无需运行外部诊断包或修改 SnowLuma。身份无效、flag 超长、重复或过期事件只记录日志，不向群成员报错。
-扫码后 QQ 显示“群搜索”不影响处理规则；普通入群和邀请入群都依赖 `group_increase` 通知发起验证，不要求先收到申请事件。
-AstrBot 4.29.1 的唤醒前缀应使用非空值（如 `/`）；该版本在空前缀处理空消息链时存在已复现的宿主异常，发生在插件 Handler 之前。
+监听采用 AstrBot 正式群事件 Handler，从 event.message_obj.raw_message 读取申请和通知。
+普通加入和邀请加入均依赖 group_increase 通知触发验证，不要求先收到申请。AstrBot 4.29.1 应使用非空唤醒前缀，例如 `/`。
+`/g y`、`/g n` 没有有效待办时静默；只处理插件接管的临时申请，不从 QQ 后台导入旧申请。重载或超过 30 分钟后需要重新发起测试申请。
 
-`/g y`、`/g n` 在没有有效待办时保持静默，日志为 `approval.selection ... rows=0`；命令只处理插件接管的临时申请，不从 QQ 后台导入旧申请。重载或超过 30 分钟后需要重新发起测试申请。
-若仍不收到卡片，临时开启 **AstrBot 全局 DEBUG 日志**（插件文件中的 DEBUG 不代表全局已开启），对照同一次新申请的两份日志：
-
-| 记录 | 定位范围 |
-| --- | --- |
-| AstrBot 无对应 `[aiocqhttp] RawMessage` 申请／通知 | 尚无到达适配器的证据，检查协议端上报和连接 |
-| 有原始申请，但无 `event.filter` | 检查转换错误、唤醒阶段、插件选择、过滤器匹配 |
-| `event.filter ... matched=True`，无 `event.received` | 已匹配但未执行；检查宿主白名单、会话开关、限流、等待器及先执行的插件 |
-| 有 `event.received` | 沿 queue／approval／render／api 查插件内部处理结果 |
-
-宿主 DEBUG 的 `plugin -> 插件名 - 处理器名` 可用于确认实际执行顺序；不要仅凭插件日志缺少事件就认定冲突。分享时仅提供测试时段片段，并遮盖 token 和完整 flag。
+SnowLuma 控制台出现 `pending group request not found` 时，应检查其申请匹配流程；v2.1.1 的该分支在事件派发前返回，插件无法处理尚未上报的申请。
 
 ## 图片和性能
 
@@ -111,8 +94,9 @@ AstrBot 4.29.1 的唤醒前缀应使用非空值（如 `/`）；该版本在空�
 细分搜索／二维码来源未由已核对 SnowLuma v2.0.3 接口提供，按确认跳过，不猜测来源。
 
 帮助面板默认使用原 default.png 的压缩 WebP 版本（约 25 KB）；可在“帮助面板背景地址”填写图片 URL，直接传址。
-没有外部字体、脚本或公式库依赖。资料查询仅一次陌生人接口，短期缓存有容量和有效期限制。渲染最多两项并发，DEBUG 日志记录排队、服务耗时及请求字节量。
+没有外部字体、脚本或公式库依赖。资料查询仅一次陌生人接口，短期缓存有容量和有效期限制。渲染最多两项并发，超时包含排队等待。
 帮助／审批卡片失败可降级文字，`/g info` 失败仅记录日志，不混发文字。
+消息顺序统一为 @目标用户、文字、图片。文字与 @ 之间留一个空格，图片前换行并独占最后一行；纯图片消息不添加 @。
 
 ## 开发
 

@@ -246,14 +246,10 @@ async def test_approval_command_with_no_pending_requests_is_silent(
         },
     )
     assert not env.api.sent and not env.api.approvals
-    with plugin.file_log.sink.condition:
-        output = "\n".join(plugin.file_log.sink.lines)
-    assert "approval.selection" in output and "rows=0" in output
-    assert "empty_wake_prefix=False" in output
 
 
 @pytest.mark.parametrize("stops", [False, True])
-async def test_event_match_is_visible_before_other_handler_can_stop_delivery(
+async def test_other_handler_stop_respects_host_dispatch(
     host_plugin, env, monkeypatch, stops
 ):
     plugin, platform = host_plugin
@@ -275,7 +271,7 @@ async def test_event_match_is_visible_before_other_handler_can_stop_delivery(
     )
     star_handlers_registry.append(interceptor)
     try:
-        await dispatch(
+        event = await dispatch(
             plugin,
             platform,
             {
@@ -291,10 +287,7 @@ async def test_event_match_is_visible_before_other_handler_can_stop_delivery(
             },
         )
         assert bool(env.renderer.cards) is not stops
-        with plugin.file_log.sink.condition:
-            output = "\n".join(plugin.file_log.sink.lines)
-        assert "event.filter" in output and "matched=True" in output
-        assert ("event.received" in output) is not stops
-        assert "private-handle" not in output and "private-reason" not in output
+        assert bool(plugin.controller.approval.requests) is not stops
+        assert event.is_stopped() is stops
     finally:
         star_handlers_registry.remove(interceptor)

@@ -3,9 +3,9 @@
 import uuid
 
 from ..models.challenge import Challenge
-from ..utils.plugin_log import error_detail, event_summary
+from ..utils.errors import error_detail
 from ..utils.scope import group_umo, scope_key
-from .rules import arithmetic, display_time
+from .rules import arithmetic
 
 
 class Verification:
@@ -17,17 +17,8 @@ class Verification:
         self.challenges = {}
 
     async def notice(self, scope, raw):
-        self.c.log.debug(
-            "verification.notice_begin scope=%s data=%s",
-            scope_key(scope),
-            event_summary(raw),
-        )
         qq = str(raw.get("user_id", ""))
         if not qq.isdigit():
-            self.c.log.info(
-                "verification.notice_ignored scope=%s reason=invalid_qq",
-                scope_key(scope),
-            )
             return
         now = self.c.clock()
         happened = float(raw.get("time") or now)
@@ -36,11 +27,6 @@ class Verification:
             member
             and max(member["last_join"] or 0, member["last_leave"] or 0) > happened
         ):
-            self.c.log.debug(
-                "verification.notice_ignored scope=%s qq=%s reason=stale_event",
-                scope_key(scope),
-                qq,
-            )
             return
         key = (scope_key(scope), qq)
         if raw["notice_type"] == "group_increase":
@@ -49,11 +35,6 @@ class Verification:
                 and member["session_id"]
                 and happened <= (member["last_join"] or 0)
             ):
-                self.c.log.debug(
-                    "verification.notice_ignored scope=%s qq=%s reason=duplicate_join",
-                    scope_key(scope),
-                    qq,
-                )
                 return
             self.challenges.pop(key, None)
             session = uuid.uuid4().hex
@@ -84,22 +65,8 @@ class Verification:
             )
             if request:
                 request.status = "joined"
-            self.c.log.info(
-                "members.join_recorded scope=%s qq=%s session=%s request_linked=%s",
-                scope_key(scope),
-                qq,
-                session,
-                request is not None,
-            )
             settings = await self.c.settings.get(scope)
             if not settings["enabled"] or qq == scope.bot:
-                self.c.log.info(
-                    "verification.skipped scope=%s qq=%s enabled=%s is_bot=%s",
-                    scope_key(scope),
-                    qq,
-                    settings["enabled"],
-                    qq == scope.bot,
-                )
                 return
             if await self.exempt(scope, qq) is True:
                 await self.c.db.verification(scope, qq, session, "exempt", now)
@@ -116,20 +83,9 @@ class Verification:
             expression, answer = arithmetic()
             challenge = Challenge(scope, qq, session, expression, answer, now)
             self.challenges[key] = challenge
-            self.c.log.info(
-                "verification.created scope=%s qq=%s session=%s state=delivery",
-                scope_key(scope),
-                qq,
-                session,
-            )
             self.c.spawn(self.deliver(challenge))
         else:
             if member and member["presence"] == "absent":
-                self.c.log.debug(
-                    "members.leave_ignored scope=%s qq=%s reason=already_absent",
-                    scope_key(scope),
-                    qq,
-                )
                 return
             self.challenges.pop(key, None)
             await self.c.db.execute(
@@ -143,9 +99,6 @@ class Verification:
             )
             if qq == scope.bot:
                 await self.c.disable(scope, scope.bot)
-            self.c.log.info(
-                "members.leave_recorded scope=%s qq=%s", scope_key(scope), qq
-            )
 
     async def exempt(self, scope, qq):
         if (
@@ -153,20 +106,9 @@ class Verification:
             or self.c.host_admin(qq, group_umo(scope))
             or (await self.c.db.flags(scope, qq))["white"]
         ):
-            self.c.log.debug(
-                "verification.exempt scope=%s qq=%s reason=bot_host_admin_or_white",
-                scope_key(scope),
-                qq,
-            )
             return True
         try:
             role = await self.c.api.role(scope, qq)
-            self.c.log.debug(
-                "verification.role_checked scope=%s qq=%s role=%s",
-                scope_key(scope),
-                qq,
-                role,
-            )
             return role in {"owner", "admin"}
         except Exception as exc:
             self.c.log.warning(
@@ -178,13 +120,6 @@ class Verification:
             return None
 
     async def finish(self, row, state):
-        self.c.log.info(
-            "verification.finished scope=%s qq=%s session=%s state=%s",
-            scope_key(row.scope),
-            row.qq,
-            row.session,
-            state,
-        )
         key = (scope_key(row.scope), row.qq)
         if self.challenges.get(key) is row:
             self.challenges.pop(key)
@@ -214,31 +149,14 @@ class Verification:
     async def answer(self, scope, qq, value):
         row = self.challenges.get((scope_key(scope), qq))
         if not row or row.state != "waiting" or row.deadline <= self.c.clock():
-            self.c.log.debug(
-                "verification.answer_ignored scope=%s qq=%s active=%s state=%s",
-                scope_key(scope),
-                qq,
-                row is not None,
-                row.state if row else None,
-            )
             return False
         if not await self.current(row) or int(value) != row.answer:
-            self.c.log.debug(
-                "verification.answer_not_accepted scope=%s qq=%s", scope_key(scope), qq
-            )
             return False
         await self.finish(row, "passed")
         return True
 
     async def deliver(self, row):
         scope = row.scope
-        self.c.log.debug(
-            "verification.delivery_begin scope=%s qq=%s state=%s attempts=%s",
-            scope_key(scope),
-            row.qq,
-            row.state,
-            row.attempts,
-        )
         async with self.c.lock(scope):
             if row.state != "delivery" or not await self.current(row):
                 return
@@ -268,18 +186,12 @@ class Verification:
                 # The deadline starts only after a successful image send.
                 await self.c.api.send(
                     scope,
-                    " 请在本题发送后 10 分钟内使用 /ans [答案] 完成验证，否则将被移出群聊。",
+                    "请在本题发送后 10 分钟内使用 /ans [答案] 完成验证，否则将被移出群聊。",
                     image=image,
                     mention=row.qq,
                 )
                 row.state = "waiting"
                 row.deadline = self.c.clock() + 600
-                self.c.log.info(
-                    "verification.delivered scope=%s qq=%s deadline=%s",
-                    scope_key(scope),
-                    row.qq,
-                    display_time(row.deadline),
-                )
                 await self.c.db.verification(
                     scope, row.qq, row.session, "waiting", self.c.clock()
                 )
@@ -299,13 +211,6 @@ class Verification:
 
     async def expire(self, row):
         scope = row.scope
-        self.c.log.debug(
-            "verification.expiry_check scope=%s qq=%s state=%s deadline=%s",
-            scope_key(scope),
-            row.qq,
-            row.state,
-            display_time(row.deadline),
-        )
         async with self.c.lock(scope):
             if (
                 row.state != "waiting"
@@ -352,12 +257,6 @@ class Verification:
             await self.finish(row, "unknown")
             state = "removed"
             try:
-                self.c.log.info(
-                    "verification.kick_dispatch scope=%s qq=%s session=%s",
-                    scope_key(scope),
-                    row.qq,
-                    row.session,
-                )
                 await self.c.api.kick(scope, row.qq)
             except Exception as exc:
                 state = "unknown"

@@ -64,6 +64,15 @@ async def test_help_is_image_even_when_disabled(env, text):
     ]
 
 
+async def test_help_text_fallback_mentions_caller(env):
+    async def fallback(now, umo):
+        return None, "指令清单"
+
+    env.renderer.help = fallback
+    await command(env, "/g help", actor="20001")
+    assert env.api.sent == [(scope_key(env.scope), "指令清单", None, "20001")]
+
+
 async def test_database_has_only_three_durable_tables(env):
     async with env.db.db.execute(
         "SELECT name FROM sqlite_master WHERE type='table'"

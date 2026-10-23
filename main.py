@@ -17,7 +17,7 @@ from .core.repository import Repository
 from .core.rules import COMMAND, GROUP_ID
 from .core.settings import Settings
 from .models.scope import Scope
-from .utils.plugin_log import PluginLog, error_detail, event_summary
+from .utils.errors import error_detail
 from .utils.scope import group_umo, scope_key
 
 
@@ -27,7 +27,7 @@ class ScopeFilter(filter.CustomFilter):
     def filter(self, event, cfg):
         controller = self.runtime() if self.runtime else None
         raw = event.message_obj.raw_message
-        allowed = bool(
+        return bool(
             controller
             and not controller.stopping
             and event.get_platform_name() == "aiocqhttp"
@@ -35,55 +35,18 @@ class ScopeFilter(filter.CustomFilter):
             and isinstance(raw, dict)
             and raw.get("post_type") == "message"
         )
-        if (
-            controller
-            and COMMAND.match(event.message_str.strip())
-            and not event.get_extra("monitor_filter_logged")
-        ):
-            event.set_extra("monitor_filter_logged", True)
-            controller.log.debug(
-                "command.filter group=%s platform=%s allowed=%s wake=%s empty_wake_prefix=%s",
-                event.get_group_id(),
-                event.get_platform_name(),
-                allowed,
-                event.is_at_or_wake_command,
-                "" in cfg.get("wake_prefix", []),
-            )
-        return allowed
 
 
 class GroupEventFilter(filter.CustomFilter):
     def filter(self, event, cfg):
         controller = ScopeFilter.runtime() if ScopeFilter.runtime else None
-        raw = event.message_obj.raw_message
-        if not controller or not GroupEvents.matches(raw):
-            return False
-        group = event.get_group_id()
-        reason = (
-            "runtime_stopping"
-            if controller.stopping
-            else "wrong_platform"
-            if event.get_platform_name() != "aiocqhttp"
-            else "group_not_selected"
-            if not controller.allows_group(group)
-            else "matched"
+        return bool(
+            controller
+            and not controller.stopping
+            and event.get_platform_name() == "aiocqhttp"
+            and controller.allows_group(event.get_group_id())
+            and GroupEvents.matches(event.message_obj.raw_message)
         )
-        matched = reason == "matched"
-        if (
-            controller.allows_group(group)
-            or controller.allows_group(str(raw.get("group_id") or ""))
-        ) and not event.get_extra("monitor_event_filter_logged"):
-            event.set_extra("monitor_event_filter_logged", True)
-            controller.log.info(
-                "event.filter platform=%s group=%s matched=%s reason=%s stopped=%s data=%s",
-                event.get_platform_id(),
-                group,
-                matched,
-                reason,
-                event.is_stopped(),
-                event_summary(raw),
-            )
-        return matched
 
 
 class GroupCommandFilter(ScopeFilter):
@@ -135,7 +98,6 @@ class GroupManager(Star):
         super().__init__(context, config)
         self.config = config if config is not None else {}
         self.controller = self.repository = self.events = None
-        self.file_log = None
         self.group_selector = GroupSelector(context, self.config, self.logger)
 
     async def initialize(self):
@@ -158,24 +120,6 @@ class GroupManager(Star):
         if not 3 <= api_timeout <= 60 or not 5 <= render_timeout <= 120:
             raise ValueError("Invalid timeout configuration")
         data = StarTools.get_data_dir("astrbot_plugin_group_manager")
-        log_task = asyncio.create_task(
-            asyncio.to_thread(PluginLog, self.logger, data / "log/monitor.log")
-        )
-        try:
-            self.file_log = await asyncio.shield(log_task)
-        except asyncio.CancelledError:
-            created_log = await log_task
-            await asyncio.to_thread(created_log.close)
-            raise
-        self.logger = self.file_log
-        self.group_selector.log = self.logger
-        self.logger.info(
-            "lifecycle.initialize enabled_groups=%s api_timeout=%s render_timeout=%s data=%s",
-            sorted(enabled_groups),
-            api_timeout,
-            render_timeout,
-            data,
-        )
         try:
             self.repository = Repository(
                 data / "db/group_manager.sqlite3",
@@ -203,9 +147,8 @@ class GroupManager(Star):
             ScopeFilter.runtime = weakref.ref(self.controller)
             self.events = GroupEvents(self.controller, self.logger)
             await self.group_selector.refresh()
-            self.logger.info("lifecycle.ready event_entry=astrbot_group_handler")
         except BaseException as exc:
-            self.logger.error("lifecycle.initialize_failed error=%s", error_detail(exc))
+            self.logger.error("Plugin initialization failed: %s", error_detail(exc))
             await self.terminate()
             raise
 
@@ -217,11 +160,6 @@ class GroupManager(Star):
         cfg = self.context.get_config(umo)
         plugins = cfg.get("plugin_set", ["*"])
         if plugins != ["*"] and "astrbot_plugin_group_manager" not in plugins:
-            self.logger.debug(
-                "scope.guard denied=plugin_set scope=%s selection=%s",
-                scope_key(scope),
-                plugins,
-            )
             return False
         settings = cfg.get("platform_settings", {})
         whitelist = {
@@ -232,15 +170,9 @@ class GroupManager(Star):
             and whitelist
             and not ({scope.group, umo} & whitelist)
         ):
-            self.logger.debug(
-                "scope.guard denied=host_whitelist scope=%s", scope_key(scope)
-            )
             return False
         allowed = await SessionPluginManager.is_plugin_enabled_for_session(
             umo, "astrbot_plugin_group_manager"
-        )
-        self.logger.debug(
-            "scope.guard session_enabled=%s scope=%s", allowed, scope_key(scope)
         )
         return allowed
 
@@ -335,9 +267,6 @@ class GroupManager(Star):
             self.events.receive(event)
 
     async def dispatch(self, event):
-        self.logger.debug(
-            "command.dispatch event=%s", event_summary(event.message_obj.raw_message)
-        )
         if not self.controller or not self.controller.allows_group(
             event.get_group_id()
         ):
@@ -365,11 +294,6 @@ class GroupManager(Star):
             )
             if task:
                 await task
-            self.logger.debug(
-                "command.dispatch_complete scope=%s scheduled=%s",
-                scope_key(scope),
-                task is not None,
-            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -381,24 +305,15 @@ class GroupManager(Star):
 
     @filter.on_platform_loaded()
     async def platform_loaded(self):
-        self.logger.info(
-            "lifecycle.platform_loaded handler_ready=%s",
-            bool(self.events and not self.events.stopped),
-        )
         if self.controller and not self.controller.stopping:
             await self.group_selector.refresh()
 
     @filter.on_astrbot_loaded()
     async def loaded(self):
-        self.logger.info(
-            "lifecycle.astrbot_loaded handler_ready=%s",
-            bool(self.events and not self.events.stopped),
-        )
         if self.controller and not self.controller.stopping:
             await self.group_selector.refresh()
 
     async def terminate(self):
-        self.logger.info("lifecycle.terminate_begin")
         if self.events:
             self.events.stop()
         try:
@@ -407,11 +322,5 @@ class GroupManager(Star):
         finally:
             if ScopeFilter.runtime and ScopeFilter.runtime() is self.controller:
                 ScopeFilter.runtime = None
-            try:
-                if self.repository:
-                    await self.repository.close()
-            finally:
-                if self.file_log:
-                    self.logger.info("lifecycle.terminate_complete")
-                    await asyncio.to_thread(self.file_log.close)
-                    self.file_log = None
+            if self.repository:
+                await self.repository.close()

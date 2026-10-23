@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from urllib.parse import quote
 
-from ..utils.plugin_log import error_detail
+from ..utils.errors import error_detail
 from ..utils.scope import group_umo
 
 DEFAULTS = {"enabled": False, "auto_approve": False, "skip_ban": False, "revision": 0}
@@ -33,13 +33,6 @@ class Settings:
         return data
 
     async def get(self, scope):
-        if self.log:
-            self.log.debug(
-                "settings.read_begin umo=%s bot=%s file=%s",
-                group_umo(scope),
-                scope.bot,
-                self.path(scope).name,
-            )
         async with self.locks[hash(group_umo(scope)) % len(self.locks)]:
             try:
                 data = await asyncio.to_thread(self._read, scope)
@@ -56,27 +49,9 @@ class Settings:
         for key in ("enabled", "auto_approve", "skip_ban"):
             if type(row[key]) is not bool:
                 raise ValueError("Invalid group setting type")
-        if self.log:
-            self.log.debug(
-                "settings.read_complete umo=%s bot=%s enabled=%s auto=%s skip_ban=%s revision=%s",
-                group_umo(scope),
-                scope.bot,
-                row["enabled"],
-                row["auto_approve"],
-                row["skip_ban"],
-                row["revision"],
-            )
         return row
 
     async def update(self, scope, actor, now, **changes):
-        if self.log:
-            self.log.info(
-                "settings.update_begin umo=%s bot=%s actor=%s changes=%s",
-                group_umo(scope),
-                scope.bot,
-                actor,
-                changes,
-            )
         async with self.locks[hash(group_umo(scope)) % len(self.locks)]:
 
             def write():
@@ -103,13 +78,6 @@ class Settings:
             task = asyncio.create_task(asyncio.to_thread(write))
             try:
                 result = await asyncio.shield(task)
-                if self.log:
-                    self.log.info(
-                        "settings.update_complete umo=%s bot=%s revision=%s",
-                        group_umo(scope),
-                        scope.bot,
-                        result["revision"],
-                    )
                 return result
             except asyncio.CancelledError:
                 await task

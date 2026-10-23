@@ -1,12 +1,11 @@
 """Serialized SQLite access with cancellation-safe transactions."""
 
 import asyncio
-import time
 from pathlib import Path
 
 import aiosqlite
 
-from .plugin_log import error_detail
+from .errors import error_detail
 
 
 class Database:
@@ -18,8 +17,6 @@ class Database:
         self.log = logger
 
     async def open(self):
-        if self.log:
-            self.log.info("db.open_begin path=%s", self.path)
         for block in (
             (self.resources / "queries.sql")
             .read_text(encoding="utf-8")
@@ -34,20 +31,13 @@ class Database:
             await self.db.executescript(
                 (self.resources / "schema.sql").read_text(encoding="utf-8")
             )
-            if self.log:
-                self.log.info("db.open_complete named_queries=%s", len(self.queries))
         except BaseException:
             await self.db.close()
             self.db = None
             raise
 
     async def _run(self, jobs, write):
-        started = time.monotonic()
         names = sorted({name for name, _ in jobs})
-        if self.log:
-            self.log.debug(
-                "db.batch_begin write=%s jobs=%s queries=%s", write, len(jobs), names
-            )
         async with self.lock:
             results = []
             try:
@@ -65,14 +55,6 @@ class Database:
                             )
                         )
                 await self.db.commit()
-                if self.log:
-                    self.log.debug(
-                        "db.batch_complete queries=%s rows=%s affected=%s duration_ms=%.0f",
-                        names,
-                        sum(len(rows) for rows, _ in results),
-                        sum(max(count, 0) for _, count in results),
-                        (time.monotonic() - started) * 1000,
-                    )
             except BaseException as exc:
                 await self.db.rollback()
                 if self.log:
@@ -89,8 +71,6 @@ class Database:
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
-            if self.log:
-                self.log.debug("db.cancel_waiting_for_transaction")
             await task
             raise
 
@@ -107,13 +87,9 @@ class Database:
     async def close(self):
         async with self.lock:
             if self.db:
-                if self.log:
-                    self.log.info("db.close_begin")
                 try:
                     async with self.db.execute(self.queries["checkpoint"]) as cursor:
                         await cursor.fetchall()
                 finally:
                     await self.db.close()
                     self.db = None
-                    if self.log:
-                        self.log.info("db.close_complete")

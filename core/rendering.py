@@ -3,13 +3,11 @@
 import asyncio
 import base64
 import html
-import json
 import re
-import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-from ..utils.plugin_log import error_detail
+from ..utils.errors import error_detail
 from ..utils.scope import parse_scope
 from .rules import display_time, light_theme
 
@@ -276,60 +274,20 @@ class Renderer:
         )
 
     async def _render(self, template, data, umo, width, transparent):
-        started = time.monotonic()
-        kind = (
-            "help"
-            if data.get("panel") == "help"
-            else "formula"
-            if "mathml" in data
-            else "card"
-        )
-        if self.log:
-            self.log.debug("render.begin kind=%s umo=%s width=%s", kind, umo, width)
-        acquired = None
-        try:
-            async with asyncio.timeout(self.timeout):
-                async with self.limit:
-                    acquired = time.monotonic()
-                    result = await self.render(
-                        template,
-                        data,
-                        return_url=True,
-                        umo=umo,
-                        options={
-                            "type": "png",
-                            "full_page": True,
-                            "omit_background": transparent,
-                            "viewport_width": width,
-                            "viewport_height": 1,
-                            "animations": "disabled",
-                            "scale": "css",
-                        },
-                    )
-                    if self.log:
-                        self.log.debug(
-                            "render.complete kind=%s umo=%s image_available=%s",
-                            kind,
-                            umo,
-                            bool(result),
-                        )
-                    return result
-        except Exception as exc:
-            if self.log:
-                self.log.error(
-                    "render.failed kind=%s umo=%s error=%s",
-                    kind,
-                    umo,
-                    error_detail(exc),
-                )
-            raise
-        finally:
-            ended = time.monotonic()
-            if self.log:
-                self.log.debug(
-                    "Template render: queue_ms=%.0f service_ms=%.0f payload_bytes=%s",
-                    ((acquired or ended) - started) * 1000,
-                    (ended - acquired) * 1000 if acquired else 0,
-                    len(template.encode("utf-8"))
-                    + len(json.dumps(data, ensure_ascii=False).encode("utf-8")),
+        async with asyncio.timeout(self.timeout):
+            async with self.limit:
+                return await self.render(
+                    template,
+                    data,
+                    return_url=True,
+                    umo=umo,
+                    options={
+                        "type": "png",
+                        "full_page": True,
+                        "omit_background": transparent,
+                        "viewport_width": width,
+                        "viewport_height": 1,
+                        "animations": "disabled",
+                        "scale": "css",
+                    },
                 )

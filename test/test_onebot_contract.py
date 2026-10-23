@@ -59,6 +59,54 @@ async def test_actions_select_original_bot_and_preserve_request_flag():
     assert all(action != "get_login_info" for action, _ in calls)
 
 
+@pytest.mark.parametrize(
+    ("text", "image", "mention", "expected"),
+    [
+        (
+            "验证提示",
+            "https://example.test/formula.png",
+            "20001",
+            [
+                {"type": "at", "data": {"qq": "20001"}},
+                {"type": "text", "data": {"text": " 验证提示\n"}},
+                {"type": "image", "data": {"file": "https://example.test/formula.png"}},
+            ],
+        ),
+        (
+            "操作完成。",
+            None,
+            "10001",
+            [
+                {"type": "at", "data": {"qq": "10001"}},
+                {"type": "text", "data": {"text": " 操作完成。"}},
+            ],
+        ),
+        (
+            "",
+            "https://example.test/card.png",
+            "20001",
+            [{"type": "image", "data": {"file": "https://example.test/card.png"}}],
+        ),
+        (
+            "首行\n末行\n\n",
+            "https://example.test/card.png",
+            None,
+            [
+                {"type": "text", "data": {"text": "首行\n末行\n"}},
+                {"type": "image", "data": {"file": "https://example.test/card.png"}},
+            ],
+        ),
+    ],
+)
+async def test_message_order_and_image_line(text, image, mention, expected):
+    api, calls, scope = transport()
+    await api.send(scope, text, image=image, mention=mention)
+    action, params = calls[-1]
+    assert action == "send_group_msg"
+    assert params["self_id"] == 99999 and params["group_id"] == 12345
+    assert params["message"] == expected
+
+
 async def test_actual_cqhttp_router_rejects_disconnected_original_account(monkeypatch):
     socket = SimpleNamespace(send=AsyncMock())
     router = WebSocketReverseApi({"88888": socket}, set(), 1)

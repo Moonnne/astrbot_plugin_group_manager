@@ -7,7 +7,7 @@ import time
 from collections import OrderedDict
 from dataclasses import asdict
 
-from ..utils.plugin_log import error_detail, event_summary, flag_ref
+from ..utils.errors import error_detail
 from ..utils.scope import group_umo, scope_key
 from .approval import Approval
 from .rules import display_time, parse_command
@@ -58,56 +58,26 @@ class Controller:
         return str(group) in self.enabled_groups
 
     async def allows_scope(self, scope):
-        allowed = self.allows_group(scope.group) and (
+        return self.allows_group(scope.group) and (
             self.scope_guard is None or await self.scope_guard(scope)
         )
-        self.log.debug(
-            "scope.check scope=%s group_selected=%s allowed=%s",
-            scope_key(scope),
-            self.allows_group(scope.group),
-            allowed,
-        )
-        return allowed
 
     async def start(self):
         self.stopping = False
         self.workers = [asyncio.create_task(self.work()) for _ in range(4)]
         self.timer = asyncio.create_task(self.run_timer())
-        self.log.info(
-            "runtime.started workers=%s queue_limit=%s task_limit=%s",
-            len(self.workers),
-            self.QUEUE_SIZE,
-            self.MAX_TASKS,
-        )
 
     def enqueue(self, scope, raw):
         if self.stopping or not self.allows_group(scope.group):
-            self.log.debug(
-                "queue.rejected scope=%s stopping=%s group_selected=%s",
-                scope_key(scope),
-                self.stopping,
-                self.allows_group(scope.group),
-            )
             return
         try:
             self.queue.put_nowait((scope, raw))
-            self.log.debug(
-                "queue.enqueued scope=%s depth=%s event=%s",
-                scope_key(scope),
-                self.queue.qsize(),
-                event_summary(raw),
-            )
         except asyncio.QueueFull:
             self.log.warning("Group event queue full: scope=%s", scope_key(scope))
 
     async def work(self):
         while True:
             scope, raw = await self.queue.get()
-            self.log.debug(
-                "queue.dequeued scope=%s remaining=%s",
-                scope_key(scope),
-                self.queue.qsize(),
-            )
             try:
                 await self.handle(scope, group_umo(scope), raw, "")
             except asyncio.CancelledError:
@@ -120,7 +90,6 @@ class Controller:
                 )
             finally:
                 self.queue.task_done()
-                self.log.debug("queue.event_complete scope=%s", scope_key(scope))
 
     def spawn(self, coroutine):
         if self.stopping or len(self.background) >= self.MAX_TASKS:
@@ -130,31 +99,14 @@ class Controller:
         task = asyncio.create_task(coroutine)
         self.background.add(task)
         task.add_done_callback(self._completed)
-        self.log.debug(
-            "task.spawned name=%s pending=%s", task.get_name(), len(self.background)
-        )
         return task
 
     def _completed(self, task):
         self.background.discard(task)
         if not task.cancelled() and task.exception():
             self.log.error("Background task failed: %s", error_detail(task.exception()))
-        self.log.debug(
-            "task.completed name=%s cancelled=%s pending=%s",
-            task.get_name(),
-            task.cancelled(),
-            len(self.background),
-        )
 
     async def stop(self):
-        self.log.info(
-            "runtime.stop_begin tasks=%s queue=%s requests=%s snapshots=%s challenges=%s",
-            len(self.background),
-            self.queue.qsize(),
-            len(self.approval.requests),
-            len(self.approval.snapshots),
-            len(self.verification.challenges),
-        )
         self.stopping = True
         tasks = [*self.background, *self.workers]
         if self.timer:
@@ -189,7 +141,6 @@ class Controller:
         self.seen.clear()
         if hasattr(self.api, "clear"):
             self.api.clear()
-        self.log.info("runtime.stop_complete")
 
     async def run_timer(self):
         while not self.stopping:
@@ -206,14 +157,6 @@ class Controller:
         if hasattr(self.api, "prune"):
             self.api.prune()
         self.approval.prune()
-        if self.approval.requests or self.verification.challenges:
-            self.log.debug(
-                "timer.tick requests=%s snapshots=%s challenges=%s scheduled=%s",
-                len(self.approval.requests),
-                len(self.approval.snapshots),
-                len(self.verification.challenges),
-                len(self.scheduled),
-            )
         while self.seen and next(iter(self.seen.values())) <= now:
             self.seen.popitem(last=False)
         for key, row in list(self.verification.challenges.items()):
@@ -241,27 +184,10 @@ class Controller:
                     task.add_done_callback(lambda _, k=key: self.scheduled.discard(k))
 
     async def handle(self, scope, umo, raw, actor, text="", superuser=False):
-        self.log.debug(
-            "flow.begin scope=%s stopping=%s event=%s",
-            scope_key(scope),
-            self.stopping,
-            event_summary(raw),
-        )
         if self.stopping or not await self.allows_scope(scope):
-            self.log.info(
-                "flow.ignored scope=%s reason=stopping_or_scope_denied",
-                scope_key(scope),
-            )
             return
         if raw.get("post_type") == "message":
             cmd = parse_command(text)
-            self.log.debug(
-                "command.parsed scope=%s actor=%s valid=%s verb=%s",
-                scope_key(scope),
-                actor,
-                cmd is not None,
-                cmd.verb if cmd else None,
-            )
             if cmd:
                 await self.command(scope, actor, cmd, superuser)
             return
@@ -286,9 +212,6 @@ class Controller:
             ]
             key = hashlib.sha256(json.dumps(fields).encode()).hexdigest()
             if self.seen.get(key, 0) > self.clock():
-                self.log.debug(
-                    "flow.duplicate scope=%s event_ref=%s", scope_key(scope), key[:12]
-                )
                 return
             if raw.get("post_type") == "request" and raw.get("request_type") == "group":
                 row = await self.approval.receive(scope, raw)
@@ -301,37 +224,27 @@ class Controller:
             self.seen.move_to_end(key)
             while len(self.seen) > 8192:
                 self.seen.popitem(last=False)
-            self.log.debug(
-                "flow.state_updated scope=%s new_request=%s seen_size=%s",
-                scope_key(scope),
-                bool(row),
-                len(self.seen),
-            )
         if row:
             self.spawn(self.show_request(scope, row))
 
     async def disable(self, scope, actor):
-        self.log.info("group.disable_begin scope=%s actor=%s", scope_key(scope), actor)
         await self.settings.update(scope, actor, self.clock(), enabled=False)
         self.approval.clear_group(scope)
         for key, row in list(self.verification.challenges.items()):
             if row.scope == scope:
                 await self.verification.finish(row, "cancelled")
-        self.log.info("group.disable_complete scope=%s", scope_key(scope))
 
     async def command(self, scope, actor, cmd, superuser=False):
-        self.log.debug(
-            "command.begin scope=%s actor=%s verb=%s superuser=%s",
-            scope_key(scope),
-            actor,
-            cmd.verb if cmd else None,
-            superuser,
-        )
         if not cmd or self.stopping or not await self.allows_scope(scope):
             return
         if cmd.verb == "help":
             image, plain = await self.renderer.help(self.clock(), group_umo(scope))
-            await self.api.send(scope, "" if image else plain, image=image)
+            await self.api.send(
+                scope,
+                "" if image else plain,
+                image=image,
+                mention=None if image else actor,
+            )
             return
         reply, review, rows, info = "", None, [], False
         async with self.lock(scope):
@@ -340,7 +253,7 @@ class Controller:
                 if settings["enabled"] and await self.verification.answer(
                     scope, actor, cmd.target
                 ):
-                    reply = "验证通过。"
+                    reply = "验证通过"
             else:
                 role = "owner" if superuser else await self.api.role(scope, actor)
                 rank = {"owner": 2, "admin": 1}.get(role, 0)
@@ -351,20 +264,7 @@ class Controller:
                 )
                 if cmd.verb == "rmpb":
                     required = 0
-                self.log.debug(
-                    "command.permission scope=%s actor=%s role=%s rank=%s required=%s",
-                    scope_key(scope),
-                    actor,
-                    role,
-                    rank,
-                    required,
-                )
                 if rank < required:
-                    self.log.info(
-                        "command.ignored scope=%s verb=%s reason=insufficient_permission",
-                        scope_key(scope),
-                        cmd.verb,
-                    )
                     return
                 if cmd.verb in {"on", "off"}:
                     enabled = cmd.verb == "on"
@@ -401,19 +301,6 @@ class Controller:
                     info = True
                 elif cmd.verb in {"y", "n"} and settings["enabled"]:
                     rows, review = self.approval.select(scope, cmd.target)
-                    self.log.info(
-                        "approval.selection scope=%s verb=%s target=%s rows=%s snapshot=%s",
-                        scope_key(scope),
-                        cmd.verb,
-                        cmd.target,
-                        len(rows),
-                        bool(review),
-                    )
-                elif cmd.verb in {"y", "n"}:
-                    self.log.info(
-                        "approval.selection_ignored scope=%s reason=group_disabled",
-                        scope_key(scope),
-                    )
         if rows and not review:
             counts = {"approved": 0, "rejected": 0, "unknown": 0}
             for row in rows:
@@ -452,16 +339,10 @@ class Controller:
                         scope,
                         "请使用 /g y [编号/all] 或 /g n [编号/all]。\n"
                         f"编号全群共用，截止 {display_time(review.expires_at)}；申请仍以各自的半小时期限为准。",
+                        mention=actor,
                     )
 
     async def show_request(self, scope, row, title="入群申请", review=None):
-        self.log.debug(
-            "card.request_begin scope=%s request=%s flag_ref=%s status=%s",
-            scope_key(scope),
-            row.id,
-            flag_ref(row.flag),
-            row.status,
-        )
         profile = await self.api.profile(scope, row.qq)
         flags = await self.db.flags(scope, row.qq)
         member = await self.db.member(scope, row.qq)
@@ -483,30 +364,18 @@ class Controller:
                 or not (await self.settings.get(scope))["enabled"]
                 or not await self.allows_scope(scope)
             ):
-                self.log.info(
-                    "card.request_discarded scope=%s request=%s reason=stale_disabled_or_denied",
-                    scope_key(scope),
-                    row.id,
-                )
                 return False
             if review and self.approval.snapshots.get(scope_key(scope)) is not review:
-                self.log.info(
-                    "card.request_discarded scope=%s request=%s reason=snapshot_replaced",
-                    scope_key(scope),
-                    row.id,
-                )
                 return False
-            await self.api.send(scope, "" if image else plain, image=image)
-            self.log.info(
-                "card.request_sent scope=%s request=%s image=%s",
-                scope_key(scope),
-                row.id,
-                bool(image),
+            await self.api.send(
+                scope,
+                "" if image else plain,
+                image=image,
+                mention=None if image else row.qq,
             )
         return True
 
     async def show_info(self, scope, qq):
-        self.log.debug("card.info_begin scope=%s qq=%s", scope_key(scope), qq)
         profile = await self.api.profile(scope, qq)
         flags = await self.db.flags(scope, qq)
         member = await self.db.member(scope, qq)
@@ -548,18 +417,11 @@ class Controller:
             if not await self.allows_scope(scope):
                 return
             await self.api.send(scope, image=image)
-            self.log.debug(
-                "card.info_page_sent scope=%s qq=%s offset=%s",
-                scope_key(scope),
-                qq,
-                offset,
-            )
             if len(history) < 5:
                 break
             offset += 5
 
     async def sync_members(self, scope):
-        self.log.debug("members.sync_begin scope=%s", scope_key(scope))
         if not self.allows_group(scope.group):
             return
         try:
@@ -585,11 +447,6 @@ class Controller:
                         )
                 if jobs:
                     await self.db.batch(jobs)
-                self.log.info(
-                    "members.sync_complete scope=%s imported=%s",
-                    scope_key(scope),
-                    len(jobs),
-                )
         except Exception as exc:
             self.log.warning(
                 "Member snapshot failed: scope=%s error=%s",

@@ -1,7 +1,6 @@
 """Validate OneBot payloads delivered by the AstrBot group event handler."""
 
 from ..models.scope import Scope
-from ..utils.plugin_log import event_summary
 from .rules import GROUP_ID, QQ
 
 
@@ -9,7 +8,6 @@ class GroupEvents:
     def __init__(self, controller, logger):
         self.controller, self.log = controller, logger
         self.stopped = False
-        self.log.info("event.handler_ready entry=astrbot_group_handler")
 
     @staticmethod
     def matches(raw):
@@ -25,11 +23,6 @@ class GroupEvents:
         if self.stopped or self.controller.stopping or not self.matches(raw):
             return
         platform = event.get_platform_id()
-        self.log.info(
-            "event.received entry=astrbot_group_handler platform=%s data=%s",
-            platform,
-            event_summary(raw),
-        )
         group, bot, user = (
             str(raw.get(key) or "") for key in ("group_id", "self_id", "user_id")
         )
@@ -42,13 +35,6 @@ class GroupEvents:
             or bot != event.get_self_id()
             or not self.controller.allows_group(group)
         ):
-            self.log.info(
-                "event.filtered reason=invalid_scope_or_identity platform=%s group=%s bot=%s user=%s",
-                platform,
-                group,
-                bot,
-                user,
-            )
             return
         if len(str(raw.get("flag") or "")) > 4096:
             self.log.warning("event.filtered reason=oversized_flag group=%s", group)
@@ -78,4 +64,3 @@ class GroupEvents:
 
     def stop(self):
         self.stopped = True
-        self.log.info("event.handler_stopped")

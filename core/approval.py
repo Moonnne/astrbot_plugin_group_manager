@@ -5,9 +5,9 @@ from dataclasses import asdict
 
 from ..models.join_request import JoinRequest
 from ..models.review_snapshot import ReviewSnapshot
-from ..utils.plugin_log import error_detail, flag_ref
+from ..utils.errors import error_detail
 from ..utils.scope import scope_key
-from .rules import decision, display_time
+from .rules import decision
 
 
 class Approval:
@@ -21,7 +21,6 @@ class Approval:
 
     def prune(self):
         now = self.c.clock()
-        before = (len(self.requests), len(self.snapshots))
         self.requests = {
             key: row for key, row in self.requests.items() if row.expires_at > now
         }
@@ -31,9 +30,6 @@ class Approval:
             if row.expires_at > now
             and any(value in self.requests for value in row.items.values())
         }
-        after = (len(self.requests), len(self.snapshots))
-        if before != after:
-            self.c.log.debug("approval.prune before=%s after=%s", before, after)
 
     def clear_group(self, scope):
         self.requests = {
@@ -52,17 +48,8 @@ class Approval:
         )
 
     async def receive(self, scope, raw):
-        self.c.log.debug(
-            "approval.receive_begin scope=%s flag_ref=%s subtype=%s",
-            scope_key(scope),
-            flag_ref(raw.get("flag")),
-            raw.get("sub_type"),
-        )
         settings = await self.c.settings.get(scope)
         if not settings["enabled"]:
-            self.c.log.info(
-                "approval.ignored scope=%s reason=group_disabled", scope_key(scope)
-            )
             return None
         subtype = raw.get("sub_type")
         inviter = ""
@@ -73,11 +60,6 @@ class Approval:
             qq = str(raw.get("invited_id") or "")
             inviter = str(raw.get("user_id") or "")
         else:
-            self.c.log.info(
-                "approval.ignored scope=%s reason=unsupported_subtype subtype=%s",
-                scope_key(scope),
-                subtype,
-            )
             return None
         flag = raw.get("flag")
         if (
@@ -87,21 +69,9 @@ class Approval:
             or not flag
             or len(flag) > 4096
         ):
-            self.c.log.info(
-                "approval.ignored scope=%s reason=invalid_identity_or_flag qq=%s bot=%s flag_present=%s",
-                scope_key(scope),
-                qq,
-                scope.bot,
-                bool(flag),
-            )
             return None
         self.prune()
         if any(r.scope == scope and r.flag == flag for r in self.requests.values()):
-            self.c.log.debug(
-                "approval.duplicate scope=%s flag_ref=%s",
-                scope_key(scope),
-                flag_ref(flag),
-            )
             return None
         if (
             len(self.requests) >= self.MAX_REQUESTS
@@ -125,45 +95,17 @@ class Approval:
         self.requests[row.id] = row
         flags = await self.c.db.flags(scope, qq)
         action = decision(settings, flags)
-        self.c.log.info(
-            "approval.accepted scope=%s request=%s flag_ref=%s qq=%s expires=%s policy=%s white=%s black=%s public=%s auto=%s skip_ban=%s",
-            scope_key(scope),
-            row.id,
-            flag_ref(flag),
-            qq,
-            display_time(row.expires_at),
-            action,
-            flags["white"],
-            flags["black"],
-            flags["public"],
-            settings["auto_approve"],
-            settings["skip_ban"],
-        )
         if action in {"approve", "reject"}:
             await self.act(scope, row, scope.bot, action == "approve")
         return row
 
     async def act(self, scope, row, actor, approve):
-        self.c.log.info(
-            "approval.action_begin scope=%s request=%s flag_ref=%s actor=%s approve=%s state=%s",
-            scope_key(scope),
-            row.id,
-            flag_ref(row.flag),
-            actor,
-            approve,
-            row.status,
-        )
         if (
             self.requests.get(row.id) is not row
             or row.scope != scope
             or row.status != "pending"
             or row.expires_at <= self.c.clock()
         ):
-            self.c.log.debug(
-                "approval.action_ignored scope=%s request=%s reason=stale_state_or_expired",
-                scope_key(scope),
-                row.id,
-            )
             return None
         if (
             not await self.c.allows_scope(scope)
@@ -184,12 +126,6 @@ class Approval:
                 error_detail(exc),
             )
         row.decided_at = self.c.clock() if row.status != "unknown" else None
-        self.c.log.info(
-            "approval.action_complete scope=%s request=%s result=%s",
-            scope_key(scope),
-            row.id,
-            row.status,
-        )
         return row.status
 
     def select(self, scope, target):
@@ -197,11 +133,6 @@ class Approval:
         if target:
             snapshot = self.snapshots.get(scope_key(scope))
             if not snapshot or not snapshot.active:
-                self.c.log.debug(
-                    "approval.snapshot_unavailable scope=%s target=%s",
-                    scope_key(scope),
-                    target,
-                )
                 return [], None
             ids = (
                 snapshot.items.values()
@@ -227,11 +158,4 @@ class Approval:
             return rows, None
         snapshot = ReviewSnapshot(uuid.uuid4().hex, self.c.clock() + 1800)
         self.snapshots[scope_key(scope)] = snapshot
-        self.c.log.debug(
-            "approval.snapshot_created scope=%s id=%s items=%s expires=%s",
-            scope_key(scope),
-            snapshot.id,
-            len(rows),
-            display_time(snapshot.expires_at),
-        )
         return rows, snapshot
