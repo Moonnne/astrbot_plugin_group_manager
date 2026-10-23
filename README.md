@@ -84,10 +84,22 @@ SQLite 只有三张表：`group_members`、`group_list_entries`、`public_blackl
 
 若申请无反应，重载后在目标群执行 `/g on`，再发起一条新的加群申请，随后执行 `/g y` 或 `/g n`，提供该日志用于定位。
 监听采用 AstrBot 正式群事件 Handler，从 `event.message_obj.raw_message` 读取申请和通知；参考 qqadmin 的事件接入方案。
-初始化记录 `event.handler_ready`，收到事件记录 `event.received entry=astrbot_group_handler`，随后可沿 queue、approval、verification 和 api 标签追踪。
+初始化记录 `event.handler_ready`；宿主匹配目标事件时先记录 `event.filter`，实际进入 Handler 后记录 `event.received entry=astrbot_group_handler`，随后可沿 queue、approval、verification 和 api 标签追踪。
 无需运行外部诊断包或修改 SnowLuma。身份无效、flag 超长、重复或过期事件只记录日志，不向群成员报错。
 扫码后 QQ 显示“群搜索”不影响处理规则；普通入群和邀请入群都依赖 `group_increase` 通知发起验证，不要求先收到申请事件。
 AstrBot 4.29.1 的唤醒前缀应使用非空值（如 `/`）；该版本在空前缀处理空消息链时存在已复现的宿主异常，发生在插件 Handler 之前。
+
+`/g y`、`/g n` 在没有有效待办时保持静默，日志为 `approval.selection ... rows=0`；命令只处理插件接管的临时申请，不从 QQ 后台导入旧申请。重载或超过 30 分钟后需要重新发起测试申请。
+若仍不收到卡片，临时开启 **AstrBot 全局 DEBUG 日志**（插件文件中的 DEBUG 不代表全局已开启），对照同一次新申请的两份日志：
+
+| 记录 | 定位范围 |
+| --- | --- |
+| AstrBot 无对应 `[aiocqhttp] RawMessage` 申请／通知 | 尚无到达适配器的证据，检查协议端上报和连接 |
+| 有原始申请，但无 `event.filter` | 检查转换错误、唤醒阶段、插件选择、过滤器匹配 |
+| `event.filter ... matched=True`，无 `event.received` | 已匹配但未执行；检查宿主白名单、会话开关、限流、等待器及先执行的插件 |
+| 有 `event.received` | 沿 queue／approval／render／api 查插件内部处理结果 |
+
+宿主 DEBUG 的 `plugin -> 插件名 - 处理器名` 可用于确认实际执行顺序；不要仅凭插件日志缺少事件就认定冲突。分享时仅提供测试时段片段，并遮盖 token 和完整 flag。
 
 ## 图片和性能
 

@@ -12,6 +12,16 @@ from monitor_plugin.utils.scope import scope_key
 
 from astrbot.api.star import StarTools
 from astrbot.core.config.default import DEFAULT_CONFIG
+from astrbot.core.star.filter.event_message_type import (
+    EventMessageType,
+    EventMessageTypeFilter,
+)
+from astrbot.core.star.star import StarMetadata, star_map
+from astrbot.core.star.star_handler import (
+    EventType,
+    StarHandlerMetadata,
+    star_handlers_registry,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -211,3 +221,80 @@ async def test_host_plugin_selection_blocks_event_handler(host_plugin, env):
     await settle(plugin.controller)
     assert not event.get_extra("activated_handlers")
     assert not env.api.sent and not plugin.controller.seen
+
+
+@pytest.mark.parametrize("text", ["/g y", "/g n"])
+async def test_approval_command_with_no_pending_requests_is_silent(
+    host_plugin, env, text
+):
+    plugin, platform = host_plugin
+    await dispatch(
+        plugin,
+        platform,
+        {
+            "post_type": "message",
+            "message_type": "group",
+            "sub_type": "normal",
+            "self_id": 99999,
+            "user_id": 10001,
+            "group_id": 12345,
+            "time": int(env.clock()),
+            "message_id": 4,
+            "sender": {"user_id": 10001, "nickname": "Owner"},
+            "message": [{"type": "text", "data": {"text": text}}],
+            "raw_message": text,
+        },
+    )
+    assert not env.api.sent and not env.api.approvals
+    with plugin.file_log.sink.condition:
+        output = "\n".join(plugin.file_log.sink.lines)
+    assert "approval.selection" in output and "rows=0" in output
+    assert "empty_wake_prefix=False" in output
+
+
+@pytest.mark.parametrize("stops", [False, True])
+async def test_event_match_is_visible_before_other_handler_can_stop_delivery(
+    host_plugin, env, monkeypatch, stops
+):
+    plugin, platform = host_plugin
+
+    async def intercept(event):
+        if stops:
+            event.stop_event()
+
+    module = "isolated_interceptor"
+    monkeypatch.setitem(star_map, module, StarMetadata(name=module, activated=True))
+    interceptor = StarHandlerMetadata(
+        event_type=EventType.AdapterMessageEvent,
+        handler_full_name=f"{module}.intercept",
+        handler_name="intercept",
+        handler_module_path=module,
+        handler=intercept,
+        event_filters=[EventMessageTypeFilter(EventMessageType.GROUP_MESSAGE)],
+        extras_configs={"priority": 10000},
+    )
+    star_handlers_registry.append(interceptor)
+    try:
+        await dispatch(
+            plugin,
+            platform,
+            {
+                "self_id": 99999,
+                "user_id": 20001,
+                "group_id": 12345,
+                "time": int(env.clock()),
+                "post_type": "request",
+                "request_type": "group",
+                "sub_type": "add",
+                "flag": "private-handle",
+                "comment": "private-reason",
+            },
+        )
+        assert bool(env.renderer.cards) is not stops
+        with plugin.file_log.sink.condition:
+            output = "\n".join(plugin.file_log.sink.lines)
+        assert "event.filter" in output and "matched=True" in output
+        assert ("event.received" in output) is not stops
+        assert "private-handle" not in output and "private-reason" not in output
+    finally:
+        star_handlers_registry.remove(interceptor)

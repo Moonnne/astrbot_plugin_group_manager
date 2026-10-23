@@ -2,9 +2,10 @@
 
 import asyncio
 from copy import deepcopy
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 from astrbot.core.config.default import DEFAULT_CONFIG
+from astrbot.core.pipeline.process_stage.method.star_request import StarRequestSubStage
 from astrbot.core.pipeline.waking_check.stage import WakingCheckStage
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_platform_adapter import (
     AiocqhttpAdapter,
@@ -30,9 +31,19 @@ async def run_handlers(plugin, event, config=None):
         SimpleNamespace(astrbot_config=config, db_helper=None, astrbot_config_id="test")
     )
     await stage.process(event)
-    for handler in event.get_extra("activated_handlers", []):
-        if not event.is_stopped():
-            await handler.handler(plugin, event)
+    originals = []
+    try:
+        for handler in event.get_extra("activated_handlers", []):
+            if handler.handler_module_path == "monitor_plugin.main":
+                originals.append((handler, handler.handler))
+                handler.handler = MethodType(handler.handler, plugin)
+        request = StarRequestSubStage()
+        await request.initialize(SimpleNamespace(astrbot_config=config))
+        async for _ in request.process(event):
+            pass
+    finally:
+        for handler, original in originals:
+            handler.handler = original
     return event
 
 

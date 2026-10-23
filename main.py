@@ -42,11 +42,12 @@ class ScopeFilter(filter.CustomFilter):
         ):
             event.set_extra("monitor_filter_logged", True)
             controller.log.debug(
-                "command.filter group=%s platform=%s allowed=%s wake=%s",
+                "command.filter group=%s platform=%s allowed=%s wake=%s empty_wake_prefix=%s",
                 event.get_group_id(),
                 event.get_platform_name(),
                 allowed,
                 event.is_at_or_wake_command,
+                "" in cfg.get("wake_prefix", []),
             )
         return allowed
 
@@ -54,13 +55,35 @@ class ScopeFilter(filter.CustomFilter):
 class GroupEventFilter(filter.CustomFilter):
     def filter(self, event, cfg):
         controller = ScopeFilter.runtime() if ScopeFilter.runtime else None
-        return bool(
-            controller
-            and not controller.stopping
-            and event.get_platform_name() == "aiocqhttp"
-            and controller.allows_group(event.get_group_id())
-            and GroupEvents.matches(event.message_obj.raw_message)
+        raw = event.message_obj.raw_message
+        if not controller or not GroupEvents.matches(raw):
+            return False
+        group = event.get_group_id()
+        reason = (
+            "runtime_stopping"
+            if controller.stopping
+            else "wrong_platform"
+            if event.get_platform_name() != "aiocqhttp"
+            else "group_not_selected"
+            if not controller.allows_group(group)
+            else "matched"
         )
+        matched = reason == "matched"
+        if (
+            controller.allows_group(group)
+            or controller.allows_group(str(raw.get("group_id") or ""))
+        ) and not event.get_extra("monitor_event_filter_logged"):
+            event.set_extra("monitor_event_filter_logged", True)
+            controller.log.info(
+                "event.filter platform=%s group=%s matched=%s reason=%s stopped=%s data=%s",
+                event.get_platform_id(),
+                group,
+                matched,
+                reason,
+                event.is_stopped(),
+                event_summary(raw),
+            )
+        return matched
 
 
 class GroupCommandFilter(ScopeFilter):
