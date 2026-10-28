@@ -1,4 +1,4 @@
-"""Original OneBot group identity."""
+"""Original platform instance, account, and group identity."""
 
 from dataclasses import dataclass
 

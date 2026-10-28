@@ -15,7 +15,7 @@ pytestmark = pytest.mark.asyncio
 async def test_group_is_registered_in_host_command_metadata():
     importlib.import_module("monitor_plugin.main")
     groups = [
-        f.group_name
+        f
         for handler in star_handlers_registry.get_handlers_by_event_type(
             EventType.AdapterMessageEvent, only_activated=False
         )
@@ -23,11 +23,11 @@ async def test_group_is_registered_in_host_command_metadata():
         for f in handler.event_filters
         if isinstance(f, CommandGroupFilter)
     ]
-    assert "g" in groups
+    assert any(f.group_name == "group" and f.alias == {"g"} for f in groups)
 
 
 async def test_info_sends_only_an_image(env):
-    await env.c.show_info(env.scope, "20001")
+    await env.c.cards.info(env.scope, "20001")
     assert env.api.sent
     assert all(text == "" and image for _, text, image, _ in env.api.sent)
 

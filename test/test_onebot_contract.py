@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 from aiocqhttp.api_impl import ResultStore, WebSocketReverseApi
 from aiocqhttp.exceptions import ApiNotAvailable
-from monitor_plugin.core.onebot import OneBot
+from monitor_plugin.core.adapter.onebot import OneBot
 from monitor_plugin.models.scope import Scope
 
 pytestmark = pytest.mark.asyncio

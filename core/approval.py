@@ -7,7 +7,16 @@ from ..models.join_request import JoinRequest
 from ..models.review_snapshot import ReviewSnapshot
 from ..utils.errors import error_detail
 from ..utils.scope import scope_key
-from .rules import decision
+
+
+def decision(settings: dict, flags: dict) -> str:
+    if not settings["enabled"]:
+        return "ignore"
+    if flags["white"]:
+        return "approve"
+    if flags["black"] or flags["public"]:
+        return "reject" if settings["skip_ban"] else "manual"
+    return "approve" if settings["auto_approve"] else "manual"
 
 
 class Approval:
@@ -47,27 +56,16 @@ class Approval:
             None,
         )
 
-    async def receive(self, scope, raw):
+    async def receive(self, event):
+        scope = event.scope
         settings = await self.c.settings.get(scope)
         if not settings["enabled"]:
             return None
-        subtype = raw.get("sub_type")
-        inviter = ""
-        if subtype == "add":
-            qq = str(raw.get("user_id", ""))
-        elif subtype == "invite":
-            # Standard invitations target the bot; only explicit invited_id can identify another applicant.
-            qq = str(raw.get("invited_id") or "")
-            inviter = str(raw.get("user_id") or "")
-        else:
-            return None
-        flag = raw.get("flag")
+        qq, flag = event.member, event.request_id
         if (
-            not qq.isdigit()
+            not self.c.api.for_scope(scope).valid_user(qq)
             or qq == scope.bot
-            or not isinstance(flag, str)
             or not flag
-            or len(flag) > 4096
         ):
             return None
         self.prune()
@@ -86,16 +84,19 @@ class Approval:
             scope,
             qq,
             flag,
-            subtype,
-            str(raw.get("comment") or "")[:2000],
+            event.subtype,
+            event.reason,
             now,
             now + 1800,
-            inviter,
+            event.inviter,
+            method=event.method,
         )
         self.requests[row.id] = row
         flags = await self.c.db.flags(scope, qq)
         action = decision(settings, flags)
-        if action in {"approve", "reject"}:
+        if event.approved:
+            row.status, row.actor, row.decided_at = "approved", scope.bot, now
+        elif action in {"approve", "reject"}:
             await self.act(scope, row, scope.bot, action == "approve")
         return row
 
@@ -115,7 +116,7 @@ class Approval:
         row.status = "processing"
         row.actor = actor
         try:
-            await self.c.api.approve(scope, asdict(row), approve)
+            await self.c.api.for_scope(scope).approve(scope, asdict(row), approve)
             row.status = "approved" if approve else "rejected"
         except Exception as exc:
             row.status = "unknown"
@@ -131,6 +132,14 @@ class Approval:
     def select(self, scope, target):
         self.prune()
         if target:
+            if target.startswith("r_"):
+                row = self.requests.get(target[2:])
+                return (
+                    [row]
+                    if row and row.scope == scope and row.status == "pending"
+                    else [],
+                    None,
+                )
             snapshot = self.snapshots.get(scope_key(scope))
             if not snapshot or not snapshot.active:
                 return [], None

@@ -8,8 +8,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from ..utils.errors import error_detail
+from ..utils.formatting import display_time, light_theme
 from ..utils.scope import parse_scope
-from .rules import display_time, light_theme
 
 STATUS = {
     "pending": "待审批",
@@ -23,23 +23,23 @@ STATUS = {
 }
 
 HELP_COMMANDS = (
-    ("/g · /g help", "所有成员", "显示指令清单"),
-    ("/g on · /g off", "管理员", "开关审批与验证"),
-    ("/g y · /g n", "管理员", "同意 / 拒绝，存在多条申请时进入消歧页"),
+    ("/group · /g · /group help", "所有成员", "显示指令清单"),
+    ("/group on · /group off", "管理员", "开关审批与验证"),
+    ("/group y · /group n", "管理员", "同意 / 拒绝，存在多条申请时进入消歧页"),
     (
-        "/g y [编号/all] · /g n [编号/all]",
+        "/group y [编号/all] · /group n [编号/all]",
         "管理员",
-        "全群共用编号；all 仅包含已展示申请，使用 /g y 或 /g n 刷新列表",
+        "全群共用编号；all 仅包含已展示申请，使用 /group y 或 /group n 刷新列表",
     ),
-    ("/g auto", "管理员", "切换到普通申请自动批准，默认关闭"),
-    ("/g auto skip_ban", "群主", "切换黑名单自动拒绝，非自动模式可用"),
-    ("/g ban [QQ号] [理由]", "群主", "添加本群黑名单"),
-    ("/g rmb [QQ号]", "群主", "撤销本群黑名单"),
-    ("/g wl [QQ号] [备注]", "群主", "添加本群白名单，自动批准且免验证"),
-    ("/g rmwl [QQ号]", "群主", "撤销本群白名单"),
-    ("/g pb [QQ号] [理由]", "群主", "标记为公共黑名单"),
-    ("/g rmpb [QQ号]", "原操作人", "撤销本人公共黑名单标记"),
-    ("/g info [QQ号]", "管理员", "查询本群黑名单和公共黑名单"),
+    ("/group auto", "管理员", "切换到普通申请自动批准，默认关闭"),
+    ("/group auto skip_ban", "群主", "切换黑名单自动拒绝，非自动模式可用"),
+    ("/group ban [成员ID] [理由]", "群主", "添加本群黑名单"),
+    ("/group rmb [成员ID]", "群主", "撤销本群黑名单"),
+    ("/group wl [成员ID] [备注]", "群主", "添加本群白名单，自动批准且免验证"),
+    ("/group rmwl [成员ID]", "群主", "撤销本群白名单"),
+    ("/group pb [成员ID] [理由]", "群主", "标记为公共黑名单"),
+    ("/group rmpb [成员ID]", "原操作人", "撤销本人公共黑名单标记"),
+    ("/group info [成员ID]", "管理员", "查询本群黑名单和公共黑名单"),
     ("/ans [整数答案]", "待验证成员", "回答本人入群题；成功投递后限时 10 分钟"),
 )
 
@@ -125,15 +125,11 @@ class Renderer:
             "stats": [],
         }
         if request:
-            # Search/QR attribution is not exposed by the verified protocol versions.
-            if request["subtype"] == "invite":
-                activity["method"] = (
-                    f"QQ {request['inviter']} 邀请"
-                    if request.get("inviter")
-                    else "邀请入群"
-                )
-            else:
-                activity["method"] = "申请入群"
+            activity["method"] = request.get("method") or (
+                f"QQ {request['inviter']} 邀请"
+                if request.get("inviter")
+                else "申请入群"
+            )
             activity["reason"] = request["reason"]
             activity["status"] = STATUS.get(request["status"], request["status"])
             if request["status"] in {"approved", "rejected", "joined"} and request.get(
@@ -224,7 +220,7 @@ class Renderer:
             [
                 title,
                 f"{profile['nickname']} ({qq})",
-                f"QQ 等级：{profile['level']}",
+                f"等级：{profile['level']}",
                 f"性别：{profile['sex']} · 年龄：{profile['age']} · 地区：{profile['area']}",
                 f"个性签名：{signature}",
                 *activity_text,

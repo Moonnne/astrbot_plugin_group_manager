@@ -1,0 +1,121 @@
+--- a/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py
++++ b/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py
+@@ -122,6 +122,33 @@
+             return str(self.__dict__)
+ 
+ 
++class PatchedGroupManagementEvent:
++    """Retain native group events without treating them as chat messages."""
++
++    def __init__(self, api, event_id, data):
++        self.id = event_id
++        self.raw_data = data
++
++
++def _parse_group_management_event(source, event_type, appid):
++    data = source.raw_data
++    message = AstrBotMessage()
++    message.type = MessageType.GROUP_MESSAGE
++    message.self_id = str(appid)
++    message.group_id = str(data["group_openid"])
++    message.session_id = message.group_id
++    message.sender = MessageMember(
++        user_id=str(data.get("member_openid") or appid),
++        nickname=str(data.get("username") or ""),
++    )
++    message.message_id = str(source.id or f"group-event-{time.time_ns()}")
++    message.message_str = ""
++    message.message = []
++    message.timestamp = int(time.time())
++    message.raw_message = {"t": event_type, "id": source.id, "d": data}
++    return message
++
++
+ def _ensure_group_message_create_parser() -> None:
+     """Register qq-botpy message parsers with QQ quote payload preservation."""
+ 
+@@ -153,6 +180,11 @@
+         "group_at_message_create": ("group_at_message_create", PatchedGroupMessage),
+         "c2c_message_create": ("c2c_message_create", PatchedC2CMessage),
+         "group_message_create": ("group_message_create", PatchedGroupMessage),
++        "group_join_request": ("group_join_request", PatchedGroupManagementEvent),
++        "group_member_add": ("group_member_add", PatchedGroupManagementEvent),
++        "group_member_remove": ("group_member_remove", PatchedGroupManagementEvent),
++        "group_add_robot": ("group_add_robot", PatchedGroupManagementEvent),
++        "group_del_robot": ("group_del_robot", PatchedGroupManagementEvent),
+     }
+     for parser_name, (event_name, message_cls) in parser_specs.items():
+         setattr(
+@@ -251,6 +283,26 @@
+         abm.session_id = abm.sender.user_id
+         self.platform.remember_session_scene(abm.session_id, "friend")
+         self._commit(abm)
++
++    async def on_group_join_request(self, event):
++        self._commit_group_event(event, "GROUP_JOIN_REQUEST")
++
++    async def on_group_member_add(self, event):
++        self._commit_group_event(event, "GROUP_MEMBER_ADD")
++
++    async def on_group_member_remove(self, event):
++        self._commit_group_event(event, "GROUP_MEMBER_REMOVE")
++
++    async def on_group_add_robot(self, event):
++        self._commit_group_event(event, "GROUP_ADD_ROBOT")
++
++    async def on_group_del_robot(self, event):
++        self._commit_group_event(event, "GROUP_DEL_ROBOT")
++
++    def _commit_group_event(self, event, event_type):
++        message = _parse_group_management_event(event, event_type, self.platform.appid)
++        self.platform.remember_session_scene(message.session_id, "group")
++        self.platform.commit_event(self.platform.create_event(message))
+ 
+     def _commit(self, abm: AstrBotMessage) -> None:
+         self.platform.remember_session_message_id(abm.session_id, abm.message_id)
+@@ -316,6 +368,8 @@
+         )
+ 
+         self.client.set_platform(self)
++        if qq_group:
++            self.client.intents |= 1 << 24
+ 
+         _ensure_group_message_create_parser()
+ 
+--- a/astrbot/core/platform/sources/qqofficial_webhook/qo_webhook_adapter.py
++++ b/astrbot/core/platform/sources/qqofficial_webhook/qo_webhook_adapter.py
+@@ -16,6 +16,7 @@
+ from ..qqofficial.qqofficial_platform_adapter import (
+     QQOfficialPlatformAdapter,
+     _ensure_group_message_create_parser,
++    _parse_group_management_event,
+ )
+ from .qo_webhook_event import QQOfficialWebhookMessageEvent
+ from .qo_webhook_server import QQOfficialWebhook
+@@ -88,6 +89,26 @@
+         abm.session_id = abm.sender.user_id
+         self.platform.remember_session_scene(abm.session_id, "friend")
+         self._commit(abm)
++
++    async def on_group_join_request(self, event):
++        self._commit_group_event(event, "GROUP_JOIN_REQUEST")
++
++    async def on_group_member_add(self, event):
++        self._commit_group_event(event, "GROUP_MEMBER_ADD")
++
++    async def on_group_member_remove(self, event):
++        self._commit_group_event(event, "GROUP_MEMBER_REMOVE")
++
++    async def on_group_add_robot(self, event):
++        self._commit_group_event(event, "GROUP_ADD_ROBOT")
++
++    async def on_group_del_robot(self, event):
++        self._commit_group_event(event, "GROUP_DEL_ROBOT")
++
++    def _commit_group_event(self, event, event_type):
++        message = _parse_group_management_event(event, event_type, self.platform.appid)
++        self.platform.remember_session_scene(message.session_id, "group")
++        self.platform.commit_event(self.platform.create_event(message))
+ 
+     def _commit(self, abm: AstrBotMessage) -> None:
+         self.platform.remember_session_message_id(abm.session_id, abm.message_id)

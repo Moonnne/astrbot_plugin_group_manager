@@ -8,3 +8,4 @@ class Command:
     verb: str
     target: str = ""
     note: str = ""
+    context_id: str = ""

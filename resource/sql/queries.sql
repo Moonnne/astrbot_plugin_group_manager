@@ -8,6 +8,8 @@ PRAGMA wal_checkpoint(TRUNCATE);
 SELECT * FROM group_members WHERE scope=:scope AND qq=:qq;
 -- name: history_public
 SELECT * FROM group_members WHERE qq=:qq AND scope<>:scope
+AND ((:domain='' AND json_extract(scope,'$[1]') NOT LIKE 'qqofficial:%')
+ OR (:domain<>'' AND json_extract(scope,'$[1]')=:domain))
 ORDER BY updated_at DESC LIMIT :limit OFFSET :offset;
 -- name: flags_local
 SELECT * FROM group_list_entries WHERE scope=:scope AND qq=:qq AND revoked_at IS NULL;

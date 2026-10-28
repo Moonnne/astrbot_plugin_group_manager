@@ -7,3 +7,5 @@ repo: https://github.com/Moonnne/astrbot_plugin_group_manager
 astrbot_version: '>=4.29.1,<5'
 support_platforms:
   - aiocqhttp
+  - qq_official
+  - qq_official_webhook

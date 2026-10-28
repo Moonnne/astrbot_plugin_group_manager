@@ -19,7 +19,7 @@ package.__path__ = [str(ROOT)]
 sys.modules["monitor_plugin"] = package
 
 Repository = importlib.import_module("monitor_plugin.core.repository").Repository
-Controller = importlib.import_module("monitor_plugin.core.controller").Controller
+Runtime = importlib.import_module("monitor_plugin.core.runtime").Runtime
 Settings = importlib.import_module("monitor_plugin.core.settings").Settings
 Scope = importlib.import_module("monitor_plugin.models.scope").Scope
 
@@ -36,6 +36,17 @@ class Clock:
 
 
 class Gateway:
+    def for_scope(self, scope):
+        return self
+
+    @staticmethod
+    def valid_user(value):
+        return str(value).isdigit() and len(str(value)) >= 5
+
+    async def iter_members(self, scope):
+        for value in await self.call(scope, "get_group_member_list"):
+            yield value
+
     def __init__(self):
         self.roles = {"10001": "owner", "10002": "admin", "99999": "admin"}
         self.sent, self.approvals, self.kicks = [], [], []
@@ -55,7 +66,7 @@ class Gateway:
     async def kick(self, scope, qq):
         self.kicks.append((scope_key(scope), qq))
 
-    async def send(self, scope, text="", image=None, mention=None):
+    async def send(self, scope, text="", image=None, mention=None, *, card=None):
         if self.fail_send:
             raise TimeoutError()
         self.sent.append((scope_key(scope), text, image, mention))
@@ -111,7 +122,7 @@ async def env():
     await db.open()
     clock, api, renderer = Clock(), Gateway(), Renderer()
     settings = Settings(tmp_path / "settings")
-    c = Controller(
+    c = Runtime(
         db,
         api,
         renderer,
@@ -138,4 +149,18 @@ async def env():
 
 @pytest.fixture
 def domain():
-    return importlib.import_module("monitor_plugin.core.rules")
+    return types.SimpleNamespace(
+        parse_command=importlib.import_module(
+            "monitor_plugin.core.commands"
+        ).parse_command,
+        decision=importlib.import_module("monitor_plugin.core.approval").decision,
+        arithmetic=importlib.import_module(
+            "monitor_plugin.core.verification"
+        ).arithmetic,
+        display_time=importlib.import_module(
+            "monitor_plugin.utils.formatting"
+        ).display_time,
+        light_theme=importlib.import_module(
+            "monitor_plugin.utils.formatting"
+        ).light_theme,
+    )

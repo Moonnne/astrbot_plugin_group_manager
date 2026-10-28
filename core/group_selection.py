@@ -2,12 +2,14 @@
 
 import asyncio
 
-from .rules import GROUP_ID
+from ..utils.scope import valid_selection
+from .adapter.registry import Adapters
 
 
 class GroupSelector:
-    def __init__(self, context, config, logger):
+    def __init__(self, context, config, logger, adapters=None):
         self.context, self.config, self.log = context, config, logger
+        self.adapters = adapters or Adapters(context, logger=logger)
 
     async def refresh(self):
         """Update option IDs and labels, preserving unavailable selected groups.
@@ -22,7 +24,7 @@ class GroupSelector:
         platforms = {
             str(platform.meta().id): platform
             for platform in self.context.platform_manager.platform_insts
-            if platform.meta().name == "aiocqhttp"
+            if platform.meta().name in self.adapters.protocols
         }
         choices = dict.fromkeys(self.config["enabled_groups"], "未获取群名")
         try:
@@ -36,10 +38,16 @@ class GroupSelector:
                 ):
                     continue
                 group = parts[2].removeprefix(f"{row.creator_sender_id}_")
-                if GROUP_ID.fullmatch(group):
+                protocol = self.adapters.protocols[platforms[parts[0]].meta().name]
+                selection = (
+                    group
+                    if protocol.legacy_group_ids
+                    else f"{parts[0]}:GroupMessage:{group}"
+                )
+                if valid_selection(selection):
                     name = row.user_alias or row.auto_name
                     if name:
-                        choices[group] = str(name)
+                        choices[selection] = str(name)
         except Exception as exc:
             self.log.debug("Known group names unavailable: %s", type(exc).__name__)
         results = await asyncio.gather(
@@ -61,15 +69,9 @@ class GroupSelector:
         """Bound each independent adapter lookup so one offline bot cannot block discovery."""
         try:
             async with asyncio.timeout(3):
-                groups = await platform.get_client().call_action("get_group_list")
-            if not isinstance(groups, list):
-                raise ValueError("Invalid group list response")
-            names = {}
-            for group in groups:
-                group_id = str(group.get("group_id", ""))
-                if GROUP_ID.fullmatch(group_id):
-                    names[group_id] = str(group.get("group_name") or "").strip()
-            return names
+                return await self.adapters.protocols[platform.meta().name].groups(
+                    platform
+                )
         except Exception as exc:
             self.log.debug(
                 "Group discovery unavailable: platform=%s error=%s",

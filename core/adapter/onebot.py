@@ -1,14 +1,108 @@
 """OneBot actions through AstrBot's platform adapter and account routing."""
 
 import asyncio
+import re
 import time
 from collections import OrderedDict
 
-from ..utils.errors import error_detail
-from ..utils.scope import scope_key
+from ...models.group_event import GroupEvent
+from ...models.scope import Scope
+from ...utils.errors import error_detail
+from ...utils.scope import scope_key
 
 
 class OneBot:
+    legacy_group_ids = True
+    user_pattern = re.compile(r"[1-9][0-9]{4,14}", re.ASCII)
+
+    @classmethod
+    def valid_user(cls, value):
+        return bool(cls.user_pattern.fullmatch(str(value)))
+
+    @staticmethod
+    def scope(event):
+        return Scope(event.get_platform_id(), event.get_self_id(), event.get_group_id())
+
+    @staticmethod
+    def is_message(event):
+        raw = event.message_obj.raw_message
+        return isinstance(raw, dict) and raw.get("post_type") == "message"
+
+    @staticmethod
+    def is_notice(event):
+        raw = event.message_obj.raw_message
+        return isinstance(raw, dict) and (
+            raw.get("post_type") == "request"
+            and raw.get("request_type") == "group"
+            or raw.get("post_type") == "notice"
+            and raw.get("notice_type") in {"group_increase", "group_decrease"}
+        )
+
+    def normalize(self, event):
+        if not self.is_notice(event):
+            return None
+        raw, scope = event.message_obj.raw_message, self.scope(event)
+        if len(str(raw.get("flag") or "")) > 4096:
+            return None
+        if (
+            not self.valid_user(scope.group)
+            or not self.valid_user(scope.bot)
+            or str(raw.get("group_id")) != scope.group
+            or str(raw.get("self_id")) != scope.bot
+        ):
+            return None
+        subtype = str(raw.get("sub_type") or "")
+        inviter = str(raw.get("operator_id") or "")
+        member = str(raw.get("user_id") or "")
+        if raw.get("post_type") == "request":
+            if subtype == "invite":
+                inviter, member = member, str(raw.get("invited_id") or "")
+            if subtype not in {"add", "invite"} or not self.valid_user(member):
+                return None
+            handle = raw.get("flag")
+            if not isinstance(handle, str) or not 0 < len(handle) <= 4096:
+                return None
+            return GroupEvent(
+                scope,
+                "request",
+                member,
+                float(raw.get("time") or event.message_obj.timestamp),
+                request_id=handle,
+                subtype=subtype,
+                reason=str(raw.get("comment") or "")[:2000],
+                inviter=inviter if subtype == "invite" else "",
+                method=f"QQ {inviter} 邀请" if subtype == "invite" else "申请入群",
+            )
+        if not self.valid_user(member):
+            return None
+        return GroupEvent(
+            scope,
+            "join" if raw["notice_type"] == "group_increase" else "leave",
+            member,
+            float(raw.get("time") or event.message_obj.timestamp),
+            subtype=subtype,
+            inviter=inviter,
+            method=f"QQ {inviter} 邀请"
+            if subtype == "invite" and inviter
+            else "申请入群",
+        )
+
+    async def iter_members(self, scope):
+        for member in await self.call(
+            scope, "get_group_member_list", group_id=int(scope.group)
+        ):
+            yield member
+
+    async def groups(self, platform):
+        result = await platform.get_client().call_action("get_group_list")
+        if not isinstance(result, list):
+            raise ValueError("Invalid OneBot group list")
+        return {
+            str(row["group_id"]): str(row.get("group_name") or "").strip()
+            for row in result
+            if self.valid_user(row.get("group_id", ""))
+        }
+
     def __init__(self, context, timeout=15, *, logger=None):
         self.context = context
         self.timeout = timeout
@@ -68,7 +162,7 @@ class OneBot:
             reject_add_request=False,
         )
 
-    async def send(self, scope, text="", image=None, mention=None):
+    async def send(self, scope, text="", image=None, mention=None, *, card=None):
         segments = []
         if text:
             if mention:

@@ -104,6 +104,30 @@ async def test_offline_adapter_preserves_selected_ids_and_known_group_names():
     assert choices["99999"] == "未获取群名（99999）"
 
 
+async def test_official_groups_use_scoped_umo_choices_without_onebot_actions():
+    group = "A" * 32
+    first = platform("official-ws", [], name="qq_official")
+    second = platform("official-hook", [], name="qq_official_webhook")
+    config = Config([])
+    await GroupSelector(
+        context(
+            [first, second],
+            [
+                alias(f"official-ws:GroupMessage:{group}", "官方测试群"),
+                alias(f"official-hook:GroupMessage:{group}", "Webhook 测试群"),
+            ],
+        ),
+        config,
+        logging.getLogger("monitor-test"),
+    ).refresh()
+    assert set(config.schema["enabled_groups"]["options"]) == {
+        f"official-ws:GroupMessage:{group}",
+        f"official-hook:GroupMessage:{group}",
+    }
+    first.get_client().call_action.assert_not_called()
+    second.get_client().call_action.assert_not_called()
+
+
 async def test_refresh_updates_renamed_groups_without_changing_scope():
     bot = platform("onebot", [])
     bot.get_client().call_action.side_effect = [

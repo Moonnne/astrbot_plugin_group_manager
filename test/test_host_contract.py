@@ -9,7 +9,8 @@ from unittest.mock import AsyncMock
 import pytest
 from aiocqhttp import Event
 from host import adapter
-from monitor_plugin.core.events import GroupEvents
+from monitor_plugin.core.adapter.handlers import Handlers
+from monitor_plugin.core.adapter.registry import Adapters
 from monitor_plugin.core.rendering import Renderer
 from monitor_plugin.main import GroupManager, ScopeFilter
 
@@ -90,9 +91,14 @@ async def test_real_wake_and_registered_handlers_keep_invalid_commands_silent(
     await stage.initialize(
         SimpleNamespace(astrbot_config=config, db_helper=None, astrbot_config_id="test")
     )
-    ScopeFilter.runtime = weakref.ref(env.c)
+    entries = Handlers(
+        env.c,
+        Adapters(SimpleNamespace(get_platform_inst=lambda name: platform)),
+        env.c.log,
+    )
+    ScopeFilter.runtime = weakref.ref(entries)
     plugin = object.__new__(GroupManager)
-    plugin.controller, plugin.logger = env.c, env.c.log
+    plugin.controller, plugin.logger, plugin.events = env.c, env.c.log, entries
     try:
         await stage.process(event)
         handlers = event.get_extra("activated_handlers")
@@ -164,12 +170,13 @@ async def test_host_empty_wake_prefix_rejects_notice_before_group_handlers(
 async def test_group_handler_preserves_native_wire_fields(fields):
     platform = adapter()
     received = []
-    events = GroupEvents(
+    events = Handlers(
         SimpleNamespace(
             stopping=False,
-            allows_group=lambda group: group == "12345",
-            enqueue=lambda scope, raw: received.append((scope, raw)),
+            allows_group=lambda scope: scope.group == "12345",
+            enqueue=received.append,
         ),
+        Adapters(SimpleNamespace(get_platform_inst=lambda name: platform)),
         logging.getLogger("monitor-contract"),
     )
     payload = {
@@ -184,17 +191,31 @@ async def test_group_handler_preserves_native_wire_fields(fields):
     }
     await platform.get_client()._handle_event(payload)
     host_event = platform._event_queue.get_nowait()
-    events.receive(host_event)
+    events.notice(host_event)
     assert host_event.message_obj.type == MessageType.GROUP_MESSAGE
     assert not host_event.message_str and not host_event.get_messages()
     assert len(received) == 1
-    scope, raw = received[0]
+    normalized = received[0]
+    scope = normalized.scope
     assert (scope.platform, scope.bot, scope.group) == (
         "onebot",
         "99999",
         "12345",
     )
-    assert raw == host_event.message_obj.raw_message == payload
+    assert host_event.message_obj.raw_message == payload
+    assert normalized.member == str(fields.get("invited_id") or payload["user_id"])
+    assert normalized.kind == (
+        "request"
+        if payload["post_type"] == "request"
+        else "join"
+        if payload["notice_type"] == "group_increase"
+        else "leave"
+    )
+    if normalized.kind == "request":
+        assert (
+            normalized.request_id == payload["flag"]
+            and normalized.reason == payload["comment"]
+        )
     assert platform._event_queue.empty()
 
 
@@ -219,7 +240,11 @@ async def test_plugin_data_layout_and_shutdown_are_isolated():
 
 async def test_stopped_group_handler_rejects_new_events(env):
     platform = adapter()
-    events = GroupEvents(env.c, env.c.log)
+    events = Handlers(
+        env.c,
+        Adapters(SimpleNamespace(get_platform_inst=lambda name: platform)),
+        env.c.log,
+    )
     events.stop()
     event = platform.create_event(
         await platform.convert_message(
@@ -236,7 +261,7 @@ async def test_stopped_group_handler_rejects_new_events(env):
             )
         )
     )
-    events.receive(event)
+    events.notice(event)
     assert env.c.queue.empty()
 
 

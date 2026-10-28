@@ -19,3 +19,4 @@ class JoinRequest:
     status: str = "pending"
     actor: str = ""
     decided_at: float | None = None
+    method: str = "申请入群"

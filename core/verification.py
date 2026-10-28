@@ -1,11 +1,38 @@
 """Member aggregates and bounded verification lifetimes."""
 
-import uuid
+import random
 
+from ..models.action_card import ActionCard
+from ..models.button import Button
 from ..models.challenge import Challenge
 from ..utils.errors import error_detail
 from ..utils.scope import group_umo, scope_key
-from .rules import arithmetic
+
+
+def arithmetic(rng=None) -> tuple[str, int]:
+    """Generate a safe expression; never evaluate received text."""
+    rng = rng or random.SystemRandom()
+    a, b, c = (rng.randint(1, 9) for _ in range(3))
+    kind = rng.randrange(4)
+    if kind == 0:
+        return f"{a} + {b}", a + b
+    if kind == 1:
+        a, b = max(a, b), min(a, b)
+        return f"{a} - {b}", a - b
+    if kind == 2:
+        return rf"{a} \times {b}", a * b
+    return rf"({a} + {b}) \times {c}", (a + b) * c
+
+
+def answer_options(answer, rng=None):
+    """Choose two distinct distractors without marking the correct option."""
+    rng = rng or random.SystemRandom()
+    pool = [
+        value for value in range(max(0, answer - 9), answer + 10) if value != answer
+    ]
+    options = [answer, *rng.sample(pool, 2)]
+    rng.shuffle(options)
+    return tuple(options)
 
 
 class Verification:
@@ -16,89 +43,32 @@ class Verification:
         self.c = controller
         self.challenges = {}
 
-    async def notice(self, scope, raw):
-        qq = str(raw.get("user_id", ""))
-        if not qq.isdigit():
+    async def begin(self, scope, qq, session):
+        settings = await self.c.settings.get(scope)
+        if not settings["enabled"] or qq == scope.bot:
             return
-        now = self.c.clock()
-        happened = float(raw.get("time") or now)
-        member = await self.c.db.member(scope, qq)
+        if await self.exempt(scope, qq) is True:
+            await self.c.db.verification(scope, qq, session, "exempt", self.c.clock())
+            return
         if (
-            member
-            and max(member["last_join"] or 0, member["last_leave"] or 0) > happened
+            len(self.challenges) >= self.MAX_CHALLENGES
+            or sum(c.scope == scope for c in self.challenges.values())
+            >= self.MAX_PER_GROUP
         ):
+            self.c.log.warning("Verification cache full: scope=%s", scope_key(scope))
             return
-        key = (scope_key(scope), qq)
-        if raw["notice_type"] == "group_increase":
-            if (
-                member
-                and member["session_id"]
-                and happened <= (member["last_join"] or 0)
-            ):
-                return
-            self.challenges.pop(key, None)
-            session = uuid.uuid4().hex
-            candidates = [
-                r
-                for r in self.c.approval.requests.values()
-                if r.scope == scope
-                and r.qq == qq
-                and r.expires_at > now
-                and r.status in {"pending", "approved", "unknown"}
-            ]
-            request = candidates[0] if len(candidates) == 1 else None
-            method = "申请入群"
-            if raw.get("sub_type") == "invite":
-                inviter = str(raw.get("operator_id") or "")
-                method = f"QQ {inviter} 邀请" if inviter else "邀请入群"
-            await self.c.db.execute(
-                "join_member",
-                {
-                    "scope": scope_key(scope),
-                    "qq": qq,
-                    "happened": happened,
-                    "session": session,
-                    "method": method,
-                    "reason": request.reason if request else "",
-                    "now": now,
-                },
-            )
-            if request:
-                request.status = "joined"
-            settings = await self.c.settings.get(scope)
-            if not settings["enabled"] or qq == scope.bot:
-                return
-            if await self.exempt(scope, qq) is True:
-                await self.c.db.verification(scope, qq, session, "exempt", now)
-                return
-            if (
-                len(self.challenges) >= self.MAX_CHALLENGES
-                or sum(c.scope == scope for c in self.challenges.values())
-                >= self.MAX_PER_GROUP
-            ):
-                self.c.log.warning(
-                    "Verification cache full: scope=%s", scope_key(scope)
-                )
-                return
-            expression, answer = arithmetic()
-            challenge = Challenge(scope, qq, session, expression, answer, now)
-            self.challenges[key] = challenge
-            self.c.spawn(self.deliver(challenge))
-        else:
-            if member and member["presence"] == "absent":
-                return
-            self.challenges.pop(key, None)
-            await self.c.db.execute(
-                "leave_member",
-                {
-                    "scope": scope_key(scope),
-                    "qq": qq,
-                    "happened": happened,
-                    "now": now,
-                },
-            )
-            if qq == scope.bot:
-                await self.c.disable(scope, scope.bot)
+        expression, answer = arithmetic()
+        challenge = Challenge(
+            scope,
+            qq,
+            session,
+            expression,
+            answer,
+            self.c.clock(),
+            options=answer_options(answer),
+        )
+        self.challenges[(scope_key(scope), qq)] = challenge
+        self.c.spawn(self.deliver(challenge))
 
     async def exempt(self, scope, qq):
         if (
@@ -108,7 +78,7 @@ class Verification:
         ):
             return True
         try:
-            role = await self.c.api.role(scope, qq)
+            role = await self.c.api.for_scope(scope).role(scope, qq)
             return role in {"owner", "admin"}
         except Exception as exc:
             self.c.log.warning(
@@ -146,9 +116,11 @@ class Verification:
             return False
         return True
 
-    async def answer(self, scope, qq, value):
+    async def answer(self, scope, qq, value, context_id=""):
         row = self.challenges.get((scope_key(scope), qq))
         if not row or row.state != "waiting" or row.deadline <= self.c.clock():
+            return False
+        if context_id and row.session != context_id:
             return False
         if not await self.current(row) or int(value) != row.answer:
             return False
@@ -183,12 +155,19 @@ class Verification:
                 if exempt is None:
                     row.state = "delivery"
                     return
-                # The deadline starts only after a successful image send.
-                await self.c.api.send(
+                # The deadline starts only after a successful question send.
+                await self.c.api.for_scope(scope).send(
                     scope,
                     "请在本题发送后 10 分钟内使用 /ans [答案] 完成验证，否则将被移出群聊。",
                     image=image,
                     mention=row.qq,
+                    card=ActionCard(
+                        "请在本题发送后 10 分钟内点击正确答案，或使用 /ans [答案] 完成验证，否则将被移出群聊。",
+                        tuple(
+                            Button(str(value), f"/ans {value} v_{row.session}", row.qq)
+                            for value in row.options
+                        ),
+                    ),
                 )
                 row.state = "waiting"
                 row.deadline = self.c.clock() + 600
@@ -226,9 +205,10 @@ class Verification:
             if exempt is None:
                 return
             try:
-                members = await self.c.api.call(
-                    scope, "get_group_member_list", group_id=int(scope.group)
-                )
+                members = [
+                    member
+                    async for member in self.c.api.for_scope(scope).iter_members(scope)
+                ]
                 target = next(
                     (m for m in members if str(m.get("user_id")) == row.qq), None
                 )
@@ -242,7 +222,10 @@ class Verification:
                 if float(target.get("join_time") or 0) > member["last_join"] + 2:
                     await self.finish(row, "stale")
                     return
-                if await self.c.api.role(scope, scope.bot) not in {"owner", "admin"}:
+                if await self.c.api.for_scope(scope).role(scope, scope.bot) not in {
+                    "owner",
+                    "admin",
+                }:
                     await self.finish(row, "no_permission")
                     return
             except Exception as exc:
@@ -257,7 +240,7 @@ class Verification:
             await self.finish(row, "unknown")
             state = "removed"
             try:
-                await self.c.api.kick(scope, row.qq)
+                await self.c.api.for_scope(scope).kick(scope, row.qq)
             except Exception as exc:
                 state = "unknown"
                 self.c.log.warning(

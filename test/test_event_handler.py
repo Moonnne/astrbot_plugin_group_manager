@@ -155,7 +155,7 @@ async def test_join_without_request_sends_one_formula_and_can_answer(
 
 async def test_disabled_group_still_records_join_and_leave(host_plugin, env):
     plugin, platform = host_plugin
-    await plugin.controller.disable(env.scope, "10001")
+    await plugin.controller.commands.disable(env.scope, "10001")
     await dispatch(plugin, platform, notice(env.clock, "invite"))
     env.clock.now += 1
     await dispatch(

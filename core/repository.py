@@ -1,7 +1,7 @@
 """Durable member aggregates and local/public list operations."""
 
 from ..utils.database import Database
-from ..utils.scope import scope_key
+from ..utils.scope import public_identity, scope_key
 
 
 class Repository(Database):
@@ -11,9 +11,17 @@ class Repository(Database):
     async def flags(self, scope, qq):
         params = {"scope": scope_key(scope), "qq": qq}
         results = await self.batch(
-            [("flags_local", params), ("flags_public", params)], write=False
+            [
+                ("flags_local", params),
+                ("flags_public", {"qq": public_identity(scope, qq)}),
+            ],
+            write=False,
         )
         local, public = results[0][0], results[1][0]
+        if scope.bot.startswith("qqofficial:"):
+            for row in public:
+                row["actor"] = row["actor"].removeprefix(scope.bot + ":")
+                row["qq"] = qq
         return {
             "white": any(row["kind"] == "white" for row in local),
             "black": any(row["kind"] == "black" for row in local),
@@ -40,6 +48,9 @@ class Repository(Database):
             "rmb": "revoke_local",
             "rmwl": "revoke_local",
         }[cmd.verb]
+        if cmd.verb in {"pb", "rmpb"}:
+            p["qq"] = public_identity(scope, cmd.target)
+            p["actor"] = public_identity(scope, actor)
         return await self.execute(name, p)
 
     async def verification(self, scope, qq, session, state, now):
@@ -51,5 +62,17 @@ class Repository(Database):
                 "session": session,
                 "state": state,
                 "now": now,
+            },
+        )
+
+    async def history(self, scope, user, limit, offset):
+        return await self.all(
+            "history_public",
+            {
+                "scope": scope_key(scope),
+                "qq": user,
+                "limit": limit,
+                "offset": offset,
+                "domain": scope.bot if scope.bot.startswith("qqofficial:") else "",
             },
         )

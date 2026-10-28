@@ -8,17 +8,53 @@ from pathlib import Path
 
 import pytest
 from jinja2 import Environment, StrictUndefined
+from monitor_plugin.core.approval import decision
+from monitor_plugin.core.commands import parse_command
 from monitor_plugin.core.rendering import Renderer
-from monitor_plugin.core.rules import (
-    SHANGHAI,
-    arithmetic,
-    decision,
-    display_time,
-    light_theme,
-    parse_command,
-)
+from monitor_plugin.core.verification import arithmetic
+from monitor_plugin.utils.formatting import SHANGHAI, display_time, light_theme
 
 RESOURCES = Path(__file__).resolve().parents[1] / "resource/templates"
+
+
+@pytest.mark.asyncio
+async def test_card_uses_platform_identifier_label_and_request_source():
+    captured = []
+
+    async def render(template, data, **kwargs):
+        captured.append(
+            Environment(undefined=StrictUndefined).from_string(template).render(data)
+        )
+        return "image"
+
+    profile = {
+        "nickname": "Official member",
+        "level": "未知",
+        "sex": "未公开",
+        "age": "未公开",
+        "area": "未公开",
+        "avatar": "",
+        "cover": "",
+        "id_label": "OpenID",
+    }
+    await Renderer(render, RESOURCES).card(
+        profile,
+        "B" * 32,
+        {"entries": [], "public_entries": []},
+        None,
+        [],
+        {
+            "subtype": "add",
+            "method": "OpenID inviter 邀请",
+            "reason": "reason",
+            "status": "pending",
+        },
+        "申请",
+        1800000000,
+        "official:GroupMessage:" + "A" * 32,
+    )
+    assert "OpenID " + "B" * 32 in captured[0]
+    assert "OpenID inviter 邀请" in captured[0]
 
 
 @pytest.mark.asyncio
@@ -58,7 +94,20 @@ def test_invalid_commands_are_not_exceptions(text):
     assert parse_command(text) is None
 
 
-@pytest.mark.parametrize("text", ["/g", "/g help", "g", "g help", " /g  "])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/group",
+        "/group help",
+        "group",
+        "group help",
+        "/g",
+        "/g help",
+        "g",
+        "g help",
+        " /g  ",
+    ],
+)
 def test_help_command_forms(text):
     assert parse_command(text).verb == "help"
 
@@ -79,7 +128,14 @@ async def test_help_uses_host_template_service_and_falls_back_on_failure():
     image, plain = await renderer.help(now, "original:GroupMessage:12345")
     assert image == "https://example.test/help.png"
     output, options = captured[0]
-    for command in ("/g help", "/g off", "/g n", "/g auto skip_ban", "/g rmpb", "/ans"):
+    for command in (
+        "/group help",
+        "/group off",
+        "/group n",
+        "/group auto skip_ban",
+        "/group rmpb",
+        "/ans",
+    ):
         assert command in output and command in plain
     assert options["umo"] == "original:GroupMessage:12345"
     assert options["return_url"] is True

@@ -5,16 +5,17 @@ import json
 from unittest.mock import AsyncMock
 
 import pytest
-from monitor_plugin.core.rules import parse_command
+from monitor_plugin.core.commands import parse_command
 from monitor_plugin.core.settings import Settings
+from monitor_plugin.models.group_event import GroupEvent
 from monitor_plugin.models.scope import Scope
-from monitor_plugin.utils.scope import group_umo, scope_key
+from monitor_plugin.utils.scope import scope_key
 
 pytestmark = pytest.mark.asyncio
 
 
 async def command(e, text, actor="10001", superuser=False, scope=None):
-    await e.c.command(scope or e.scope, actor, parse_command(text), superuser)
+    await e.c.commands.execute(scope or e.scope, actor, parse_command(text), superuser)
 
 
 async def enable(e):
@@ -23,16 +24,14 @@ async def enable(e):
 
 async def request(e, qq="20001", flag=None):
     return await e.c.approval.receive(
-        e.scope,
-        {
-            "post_type": "request",
-            "request_type": "group",
-            "sub_type": "add",
-            "user_id": qq,
-            "flag": flag or f"flag-{qq}",
-            "comment": "hello",
-            "time": e.clock(),
-        },
+        GroupEvent(
+            e.scope,
+            "request",
+            qq,
+            e.clock(),
+            request_id=flag or f"flag-{qq}",
+            reason="hello",
+        )
     )
 
 
@@ -40,17 +39,15 @@ async def notice(e, qq="20001", kind="group_increase", subtype="approve"):
     if kind == "group_increase":
         e.api.members[qq] = e.clock()
     await e.c.handle(
-        e.scope,
-        group_umo(e.scope),
-        {
-            "post_type": "notice",
-            "notice_type": kind,
-            "sub_type": subtype,
-            "user_id": qq,
-            "time": e.clock(),
-            "operator_id": "10001",
-        },
-        "",
+        GroupEvent(
+            e.scope,
+            "join" if kind == "group_increase" else "leave",
+            qq,
+            e.clock(),
+            subtype=subtype,
+            inviter="10001",
+            method="QQ 10001 邀请" if subtype == "invite" else "申请入群",
+        )
     )
     await asyncio.gather(*list(e.c.background))
 
@@ -332,15 +329,7 @@ async def test_runtime_caps_ttl_and_shutdown_cleanup(env):
     env.c.approval.prune()
     assert not env.c.approval.requests
     await env.c.start()
-    env.c.enqueue(
-        env.scope,
-        {
-            "post_type": "notice",
-            "notice_type": "group_increase",
-            "user_id": "20001",
-            "time": env.clock(),
-        },
-    )
+    env.c.enqueue(GroupEvent(env.scope, "join", "20001", env.clock()))
     await env.c.queue.join()
     await env.c.stop()
     assert not env.c.background and not env.c.workers and not env.c.seen
@@ -357,15 +346,7 @@ async def test_off_while_formula_is_rendering_discards_late_image(env):
         return "https://example.test/late.png"
 
     env.renderer.formula = render
-    await env.c.verification.notice(
-        env.scope,
-        {
-            "notice_type": "group_increase",
-            "sub_type": "approve",
-            "user_id": "20001",
-            "time": env.clock(),
-        },
-    )
+    await env.c.members.receive(GroupEvent(env.scope, "join", "20001", env.clock()))
     await asyncio.wait_for(started.wait(), 1)
     await command(env, "/g off")
     release.set()
@@ -423,7 +404,7 @@ async def test_member_snapshot_updates_known_join_without_inventing_leaves(env):
     await notice(env)
     env.clock.now += 100
     env.api.members["20001"] = env.clock()
-    await env.c.sync_members(env.scope)
+    await env.c.members.sync(env.scope)
     member = await env.db.member(env.scope, "20001")
     assert member["last_join"] == env.clock() and member["leave_count"] == 0
     assert member["session_id"] is None

@@ -17,3 +17,4 @@ class Challenge:
     deadline: float = 0
     next_attempt: float = 0
     attempts: int = 0
+    options: tuple[int, ...] = ()
